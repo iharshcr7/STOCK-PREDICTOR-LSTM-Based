@@ -221,90 +221,114 @@ def detect_new_file() -> Optional[str]:
 # Feature Engineering with Spark
 # ---------------------------------------------------------------------------
 
+def _ema_over_window(column_name: str, window: Window, alpha: float, min_periods: int):
+    """
+    Exact EWM (adjust=False) expressed with Spark higher-order functions.
+
+    collect_list over the ordered window yields the chronological values;
+    aggregate applies EMA_t = (1-alpha)*EMA_{t-1} + alpha*x_t starting from
+    the first value. This is mathematically equivalent to pandas
+    Series.ewm(alpha=..., adjust=False).mean(); a rolling average is never
+    presented as an EMA. Rows before `min_periods` are null (pandas parity).
+    """
+    values = F.collect_list(F.col(column_name).cast("double")).over(
+        window.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    )
+    # Null/warmup values (e.g. early MACD) must not seed the recursion.
+    clean = F.filter(values, lambda value: value.isNotNull())
+    first = F.element_at(clean, 1).cast("double")
+    tail = F.slice(clean, 2, F.size(clean) - 1)
+    ema = F.aggregate(
+        tail,
+        first,
+        lambda acc, value: ((1.0 - alpha) * acc.cast("double")) + (alpha * value.cast("double")),
+    )
+    return F.when(F.size(clean) >= min_periods, ema)
+
+
+def _rolling_mean(column_name: str, window: Window, n: int):
+    """Trailing n-row mean with pandas min_periods=n semantics."""
+    w = window.rowsBetween(-(n - 1), 0)
+    return F.when(
+        F.count(column_name).over(w) == n,
+        F.avg(column_name).over(w),
+    )
+
+
 def compute_spark_features(df: DataFrame) -> DataFrame:
     """
-    Compute all features using Spark DataFrame operations.
-    Matches the exact feature engineering from training pipeline.
-    
-    Args:
-        df: Spark DataFrame with OHLCV data
-        
-    Returns:
-        DataFrame with computed features
+    Compute the canonical feature set with Spark, correctly isolated by symbol.
+
+    All windows are partitionBy("Symbol").orderBy("Date") — no rolling value
+    can combine different stocks. EMA12/MACD/RSI use true exponential/Wilder
+    recursion, not trailing means. Duplicate (Symbol, Date) rows are removed
+    before any window calculation.
     """
-    logger.info("Computing features with Spark...")
-    
-    # Ensure numeric types
+    logger.info("Computing features with Spark (per-symbol windows)...")
+
+    if "Symbol" not in df.columns:
+        logger.warning("Input has no Symbol column; assigning 'UNKNOWN'")
+        df = df.withColumn("Symbol", F.lit("UNKNOWN"))
+
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df = df.withColumn(col, F.col(col).cast(DoubleType()))
-    
-    # Window for rolling calculations (ordered by Date)
-    window_spec = Window.orderBy("Date")
-    
-    # Moving Averages
-    df = df.withColumn("MA5", F.avg("Close").over(window_spec.rowsBetween(-4, 0)))
-    df = df.withColumn("MA10", F.avg("Close").over(window_spec.rowsBetween(-9, 0)))
-    df = df.withColumn("MA20", F.avg("Close").over(window_spec.rowsBetween(-19, 0)))
-    
-    # Daily Returns
-    df = df.withColumn("Daily_Returns", 
-                       ((F.col("Close") - F.lag("Close", 1).over(window_spec)) / 
-                        F.lag("Close", 1).over(window_spec)) * 100)
-    
-    # Volatility
+
+    df = df.withColumn("Date", F.to_date("Date"))
+    df = df.dropna(subset=["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"])
+    df = df.dropDuplicates(["Symbol", "Date"])
+
+    window_spec = Window.partitionBy("Symbol").orderBy("Date")
+
+    # Trailing means (min_periods parity with the Pandas pipeline).
+    df = df.withColumn("MA5", _rolling_mean("Close", window_spec, 5))
+    df = df.withColumn("MA10", _rolling_mean("Close", window_spec, 10))
+    df = df.withColumn("MA20", _rolling_mean("Close", window_spec, 20))
+
+    prev_close = F.lag("Close", 1).over(window_spec)
+    df = df.withColumn("Daily_Returns", ((F.col("Close") - prev_close) / prev_close) * 100.0)
     df = df.withColumn("Volatility", F.col("High") - F.col("Low"))
-    
-    # Price Change %
-    df = df.withColumn("Price_Change_Pct", 
-                       ((F.col("Close") - F.col("Open")) / F.col("Open")) * 100)
-    
-    # Lag Features
-    df = df.withColumn("Lag_1", F.lag("Close", 1).over(window_spec))
+    df = df.withColumn("Price_Change_Pct",
+                       ((F.col("Close") - F.col("Open")) / F.col("Open")) * 100.0)
+    df = df.withColumn("Lag_1", prev_close)
     df = df.withColumn("Lag_3", F.lag("Close", 3).over(window_spec))
-    
-    # EMA 12
-    df = df.withColumn("EMA12", F.avg("Close").over(window_spec.rowsBetween(-11, 0)))
-    
-    # RSI (simplified 14-period)
-    df = df.withColumn("price_change", F.col("Close") - F.lag("Close", 1).over(window_spec))
-    df = df.withColumn("gain", F.when(F.col("price_change") > 0, F.col("price_change")).otherwise(0))
-    df = df.withColumn("loss", F.when(F.col("price_change") < 0, -F.col("price_change")).otherwise(0))
-    df = df.withColumn("avg_gain", F.avg("gain").over(window_spec.rowsBetween(-13, 0)))
-    df = df.withColumn("avg_loss", F.avg("loss").over(window_spec.rowsBetween(-13, 0)))
-    df = df.withColumn("rs", F.col("avg_gain") / F.when(F.col("avg_loss") == 0, 0.0001).otherwise(F.col("avg_loss")))
-    df = df.withColumn("RSI", 100 - (100 / (1 + F.col("rs"))))
-    
-    # MACD
-    ema12_fast = F.avg("Close").over(window_spec.rowsBetween(-11, 0))
-    ema26_slow = F.avg("Close").over(window_spec.rowsBetween(-25, 0))
-    df = df.withColumn("MACD", ema12_fast - ema26_slow)
-    df = df.withColumn("MACD_Signal", F.avg("MACD").over(window_spec.rowsBetween(-8, 0)))
-    
-    # Bollinger Bands
-    sma20 = F.avg("Close").over(window_spec.rowsBetween(-19, 0))
-    std20 = F.stddev("Close").over(window_spec.rowsBetween(-19, 0))
-    df = df.withColumn("BB_Upper", sma20 + (2 * std20))
-    df = df.withColumn("BB_Lower", sma20 - (2 * std20))
-    df = df.withColumn("BB_Width", 
-                       ((F.col("BB_Upper") - F.col("BB_Lower")) / sma20) * 100)
-    
-    # Weekly Momentum
-    df = df.withColumn("Weekly_Momentum", 
-                       ((F.col("Close") - F.lag("Close", 5).over(window_spec)) / 
-                        F.lag("Close", 5).over(window_spec)) * 100)
-    
-    # Volume Trends
-    vol_ma5 = F.avg("Volume").over(window_spec.rowsBetween(-4, 0))
-    df = df.withColumn("Avg_5D_Volume_Trend", F.col("Volume") / vol_ma5)
-    
-    # Trend Strength
-    df = df.withColumn("Trend_Strength", 
-                       (F.abs(F.col("MA5") - F.col("MA20")) / F.col("MA20")) * 100)
-    
-    # Drop intermediate columns
-    df = df.drop("price_change", "gain", "loss", "avg_gain", "avg_loss", "rs", 
-                 "BB_Upper", "BB_Lower")
-    
+
+    # TRUE exponential moving averages (span -> alpha = 2/(span+1)).
+    df = df.withColumn("EMA12", _ema_over_window("Close", window_spec, 2.0 / 13.0, 12))
+    df = df.withColumn("_EMA26", _ema_over_window("Close", window_spec, 2.0 / 27.0, 26))
+    df = df.withColumn("MACD", F.col("EMA12") - F.col("_EMA26"))
+    df = df.withColumn("MACD_Signal", _ema_over_window("MACD", window_spec, 2.0 / 10.0, 9))
+
+    # Wilder RSI: EWM with alpha = 1/14, min_periods = 14.
+    change = F.col("Close") - F.lag("Close", 1).over(window_spec)
+    df = df.withColumn("_price_change", change)
+    df = df.withColumn("_gain", F.when(F.col("_price_change") > 0, F.col("_price_change")).otherwise(F.lit(0.0)))
+    df = df.withColumn("_loss", F.when(F.col("_price_change") < 0, -F.col("_price_change")).otherwise(F.lit(0.0)))
+    df = df.withColumn("_avg_gain", _ema_over_window("_gain", window_spec, 1.0 / 14.0, 14))
+    df = df.withColumn("_avg_loss", _ema_over_window("_loss", window_spec, 1.0 / 14.0, 14))
+    rs = F.col("_avg_gain") / F.when(F.col("_avg_loss") == 0, F.lit(None).cast("double")).otherwise(F.col("_avg_loss"))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    df = df.withColumn("RSI", F.when(
+        F.col("_avg_loss") == 0,
+        F.when(F.col("_avg_gain") > 0, F.lit(100.0)).otherwise(F.lit(50.0)),
+    ).otherwise(rsi))
+
+    # Bollinger width: trailing 20-row mean +/- 2 std.
+    w20 = window_spec.rowsBetween(-19, 0)
+    std20 = F.when(F.count("Close").over(w20) == 20, F.stddev("Close").over(w20))
+    df = df.withColumn("BB_Width", ((4.0 * std20) / F.col("MA20")) * 100.0)
+
+    # Momentum / volume / trend (all trailing, per symbol).
+    prev5 = F.lag("Close", 5).over(window_spec)
+    df = df.withColumn("Weekly_Momentum",
+                       F.when(F.row_number().over(window_spec) >= 6,
+                              ((F.col("Close") - prev5) / prev5) * 100.0))
+    df = df.withColumn("Avg_5D_Volume_Trend",
+                       F.col("Volume") / _rolling_mean("Volume", window_spec, 5))
+    df = df.withColumn("Trend_Strength",
+                       (F.abs(F.col("MA5") - F.col("MA20")) / F.col("MA20")) * 100.0)
+
+    df = df.drop("_price_change", "_gain", "_loss", "_avg_gain", "_avg_loss",
+                 "_EMA26", "MACD_Hist")
     logger.info("Features computed successfully")
     return df
 

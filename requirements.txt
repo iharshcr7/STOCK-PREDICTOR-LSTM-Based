@@ -1,7 +1,11 @@
 # Core
 pandas
 numpy
-scikit-learn
+# retained by the LSTM pipeline: MinMaxScaler + evaluation metrics
+# models/lstm_scaler.pkl was pickled with 1.7.2; prefer that runtime to avoid
+# the InconsistentVersionWarning. Do NOT re-pickle or refit the artifact.
+scikit-learn==1.7.2
+# retained by the LSTM pipeline: models/lstm_scaler.pkl serialization
 joblib
 pyspark==3.5.8
 

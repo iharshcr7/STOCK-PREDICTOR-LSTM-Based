@@ -1,0 +1,24 @@
+# Core
+pandas
+numpy
+scikit-learn
+joblib
+pyspark==3.5.8
+
+# Visualization
+streamlit
+plotly
+matplotlib
+mplfinance
+
+# Live Data
+yfinance
+requests
+alpha_vantage
+python-dotenv
+
+# Database
+pymongo
+
+# Deep Learning (LSTM model)
+tensorflow==2.15.0

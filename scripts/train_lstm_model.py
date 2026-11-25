@@ -15,7 +15,14 @@ Architecture:
     → Dropout(0.2)
     → Dense(32, relu)
     → Dense(1, sigmoid)
-    Output: probability of UP (>0.5 = UP, <=0.5 = DOWN)
+    Output: probability of UP (>0.5 = UP, <=0.5 = DOWN) — binary checkpoint
+
+Data contract (Phase 2): all symbols are processed independently, targets are
+3-class (0=DOWN, 1=FLAT, 2=UP) for the session after the final input date,
+sequences are per-symbol/per-block, the split is per-symbol chronological
+70/15/15 by target date, and the scaler is fitted on training rows only.
+The current binary head cannot emit FLAT; LABEL_MODE="legacy_binary" keeps it
+usable until Phase 3 retrains with a 3-class head.
 
 Usage:
     python scripts/train_lstm_model.py
@@ -30,6 +37,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import joblib
+
+from lstm_data_pipeline import (
+    FEATURE_COLUMNS as CANONICAL_FEATURES,
+    SEQUENCE_LENGTH as CANONICAL_SEQUENCE_LENGTH,
+    build_labeled_sequences,
+    chronological_partition,
+    fit_scaler_on_train,
+    split_frames_by_symbol,
+    transform_sequences,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,26 +68,25 @@ LSTM_SCALER_FILE = MODELS_DIR / "lstm_scaler.pkl"
 LSTM_METADATA_FILE = MODELS_DIR / "lstm_metadata.json"
 LSTM_HISTORY_FILE = MODELS_DIR / "lstm_history.json"   # training curves for dashboard
 
-# Same 21 features used by Random Forest — keeps pipelines consistent
-FEATURE_COLUMNS = [
-    "Open", "High", "Low", "Close", "Volume",
-    "MA5", "MA10", "MA20", "EMA12",
-    "RSI", "MACD", "MACD_Signal",
-    "Daily_Returns", "Volatility", "Price_Change_Pct",
-    "Weekly_Momentum", "Trend_Strength", "BB_Width",
-    "Avg_5D_Volume_Trend", "Lag_1", "Lag_3",
-]
+# Single canonical feature schema (names AND order) shared with live inference.
+FEATURE_COLUMNS = list(CANONICAL_FEATURES)
 
 TARGET_COLUMN = "Target"
 SYMBOL_COLUMN = "Symbol"
 DATE_COLUMN = "Date"
 
-# Stocks to train on (same as RF stable symbols)
-PREFERRED_SYMBOLS = {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"}
+# No hard-coded symbol list: every symbol in the dataset is processed
+# independently through symbol_mapper/dataset discovery upstream.
+SEQUENCE_LENGTH = CANONICAL_SEQUENCE_LENGTH  # 60 past observations
+TRAIN_FRAC = 0.70
+VAL_FRAC = 0.15
 
-# LSTM hyperparameters
-SEQUENCE_LENGTH = 60    # Number of past days used as input sequence
-TEST_SIZE = 0.2         # 80/20 chronological split
+# The stored checkpoint has a binary sigmoid head. "legacy_binary" keeps that
+# head usable (FLAT rows remain in the input series but are not emitted as
+# labelled samples). "three_class" emits 0=DOWN/1=FLAT/2=UP and requires the
+# Phase 3 softmax head + retraining. Do not switch while using the old model.
+LABEL_MODE = "legacy_binary"
+
 EPOCHS = 30
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
@@ -99,65 +115,51 @@ def filter_and_validate(df: pd.DataFrame) -> pd.DataFrame:
         sys.exit(1)
 
     df[DATE_COLUMN] = pd.to_datetime(df[DATE_COLUMN])
-    df = df[df[SYMBOL_COLUMN].isin(PREFERRED_SYMBOLS)].copy()
-    df = df.sort_values([DATE_COLUMN, SYMBOL_COLUMN]).reset_index(drop=True)
+    # Dynamic, all-symbol processing. Sorting is per symbol in the next step.
+    df = df.sort_values([SYMBOL_COLUMN, DATE_COLUMN]).reset_index(drop=True)
 
-    # Remove NaN / Inf
-    invalid = df[FEATURE_COLUMNS + [TARGET_COLUMN]].replace([np.inf, -np.inf], np.nan).isna().any(axis=1)
+    # Remove NaN / Inf in model inputs only. Target == -1 (UNKNOWN, final row
+    # of a symbol) is intentionally retained as input history.
+    invalid = df[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).isna().any(axis=1)
     df = df[~invalid].reset_index(drop=True)
 
     logger.info(
-        "Filtered dataset: %d rows | symbols=%s | %s → %s",
+        "Validated dataset: %d rows | symbols=%d | %s → %s",
         len(df),
-        sorted(df[SYMBOL_COLUMN].unique()),
+        df[SYMBOL_COLUMN].nunique(),
         df[DATE_COLUMN].min().date(),
         df[DATE_COLUMN].max().date(),
     )
     return df
 
 
-def build_sequences(df: pd.DataFrame, scaler) -> tuple:
+def build_sequences(df: pd.DataFrame) -> tuple:
     """
-    Build (X, y) sequences per stock symbol, then concatenate.
+    Build (X, y, metadata) using the canonical per-symbol/per-block builder.
 
-    For each symbol:
-        - Scale features using the fitted scaler
-        - Slide a window of SEQUENCE_LENGTH days
-        - X[i] = features[i : i+SEQUENCE_LENGTH]  shape: (SEQ_LEN, n_features)
-        - y[i] = target[i+SEQUENCE_LENGTH]
-
-    Returns
-    -------
-    X : np.ndarray  shape (n_samples, SEQUENCE_LENGTH, n_features)
-    y : np.ndarray  shape (n_samples,)
+    A sequence ending at observation t uses rows [t-59 ... t] of ONE symbol
+    and its label is Target[t] — the return from t to t+1. No cross-symbol
+    windows, no cross-gap windows, no off-by-one target.
     """
-    X_all, y_all = [], []
-
-    for symbol, group in df.groupby(SYMBOL_COLUMN):
-        group = group.sort_values(DATE_COLUMN).reset_index(drop=True)
-
-        features = group[FEATURE_COLUMNS].values.astype(np.float32)
-        targets = group[TARGET_COLUMN].values.astype(np.int32)
-
-        # Scale features
-        features_scaled = scaler.transform(features)
-
-        # Build sliding windows
-        for i in range(len(features_scaled) - SEQUENCE_LENGTH):
-            X_all.append(features_scaled[i : i + SEQUENCE_LENGTH])
-            y_all.append(targets[i + SEQUENCE_LENGTH])
-
-        logger.info("  %s: %d sequences built", symbol, len(group) - SEQUENCE_LENGTH)
-
-    X = np.array(X_all, dtype=np.float32)
-    y = np.array(y_all, dtype=np.float32)
-    logger.info("Total sequences: X=%s  y=%s", X.shape, y.shape)
-    return X, y
+    frames = split_frames_by_symbol(df)
+    X, y, meta = build_labeled_sequences(frames, label_mode=LABEL_MODE)
+    logger.info("Total sequences: X=%s  y=%s  symbols=%d", X.shape, y.shape,
+                meta[SYMBOL_COLUMN].nunique() if not meta.empty else 0)
+    return X, y, meta
 
 
-def chronological_split(X: np.ndarray, y: np.ndarray):
-    split = int(len(X) * (1 - TEST_SIZE))
-    return X[:split], X[split:], y[:split], y[split:]
+def chronological_split(meta: pd.DataFrame):
+    """
+    Leakage-safe 70/15/15 split per symbol, by each sequence's target date.
+    Returns (train_idx, val_idx, test_idx, boundary_report).
+    """
+    tr, va, te, report = chronological_partition(meta, TRAIN_FRAC, VAL_FRAC)
+    logger.info("Split: train=%d  val=%d  test=%d", len(tr), len(va), len(te))
+    if not report.empty and "status" in report.columns:
+        excluded = report[report["status"] != "included"]
+        if not excluded.empty:
+            logger.warning("Excluded %d short-history symbols from partitioning", len(excluded))
+    return tr, va, te, report
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +205,7 @@ def build_lstm_model(n_features: int, seq_len: int):
 # Training Pipeline
 # ---------------------------------------------------------------------------
 
-def train(model, X_train, y_train, X_test, y_test):
+def train(model, X_train, y_train, X_val, y_val):
     """Train with early stopping and learning rate reduction."""
     try:
         from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
@@ -237,7 +239,7 @@ def train(model, X_train, y_train, X_test, y_test):
 
     history = model.fit(
         X_train, y_train,
-        validation_data=(X_test, y_test),
+        validation_data=(X_val, y_val),
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         callbacks=callbacks,
@@ -289,7 +291,7 @@ def evaluate(model, X_test, y_test) -> dict:
     return metrics
 
 
-def save_artifacts(model, scaler, metrics: dict, history) -> None:
+def save_artifacts(model, scaler, metrics: dict, history, split_report=None) -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Model already saved by ModelCheckpoint callback — just log size
@@ -322,8 +324,16 @@ def save_artifacts(model, scaler, metrics: dict, history) -> None:
         "scaler_file": str(LSTM_SCALER_FILE),
         "feature_columns": FEATURE_COLUMNS,
         "target_column": TARGET_COLUMN,
-        "stable_symbols": sorted(PREFERRED_SYMBOLS),
+        "symbols": "dynamic (all eligible symbols from the dataset; no fixed list)",
         "sequence_length": SEQUENCE_LENGTH,
+        "target_convention": {
+            "row_t_target": "return from t to next trading session t+1",
+            "classes": {"0": "DOWN", "1": "FLAT", "2": "UP"},
+            "threshold_pct": 1.0,
+            "unknown_label": -1,
+            "flat_rows_retained_in_input_series": True,
+        },
+        "label_mode_used": LABEL_MODE,
         "architecture": {
             "layers": [
                 "LSTM(128, return_sequences=True)",
@@ -341,7 +351,12 @@ def save_artifacts(model, scaler, metrics: dict, history) -> None:
             "epochs_configured": EPOCHS,
             "epochs_trained": len(val_loss),
             "batch_size": BATCH_SIZE,
-            "split_strategy": "chronological_80_20",
+            "split_strategy": "per_symbol_chronological_70_15_15_by_target_date",
+            "scaler_fit": "training partition only; applied unchanged to val/test",
+            "partition_report": (
+                split_report.to_dict(orient="records")
+                if split_report is not None and not split_report.empty else []
+            ),
             "early_stopping": True,
         },
         "metrics": {
@@ -391,38 +406,46 @@ def main() -> None:
     df = load_dataset()
     df = filter_and_validate(df)
 
-    # 2. Fit scaler on ALL training data (before sequence split)
-    from sklearn.preprocessing import MinMaxScaler
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    all_features = df[FEATURE_COLUMNS].values.astype(np.float32)
-    scaler.fit(all_features)
-    logger.info("MinMaxScaler fitted on %d rows", len(all_features))
+    # 2. Build per-symbol sequences BEFORE scaling (no scaler leakage).
+    logger.info("Building sequences (seq_len=%d, label_mode=%s)...",
+                SEQUENCE_LENGTH, LABEL_MODE)
+    X, y, meta = build_sequences(df)
 
-    # 3. Build sequences
-    logger.info("Building sequences (seq_len=%d)...", SEQUENCE_LENGTH)
-    X, y = build_sequences(df, scaler)
+    # 3. Leakage-safe per-symbol chronological split by target date.
+    tr_idx, va_idx, te_idx, split_report = chronological_split(meta)
 
-    # 4. Chronological split
-    X_train, X_test, y_train, y_test = chronological_split(X, y)
-    logger.info("Train: %d  Test: %d", len(X_train), len(X_test))
+    # 4. Fit preprocessing on TRAIN sequences only; apply unchanged elsewhere.
+    scaler = fit_scaler_on_train(X[tr_idx])
+    logger.info("MinMaxScaler fitted on %d training rows only", len(tr_idx) * SEQUENCE_LENGTH)
 
-    # Class distribution
+    X_train = transform_sequences(scaler, X[tr_idx])
+    X_val = transform_sequences(scaler, X[va_idx])
+    X_test = transform_sequences(scaler, X[te_idx])
+    y_train, y_val, y_test = y[tr_idx], y[va_idx], y[te_idx]
+    logger.info("Train=%d  Validation=%d  Test=%d", len(X_train), len(X_val), len(X_test))
+
+    if len(X_train) == 0 or len(X_val) == 0 or len(X_test) == 0:
+        raise ValueError(
+            "One or more partitions are empty. Add historical data or relax "
+            "the short-history exclusion policy; never train on an empty split."
+        )
+
     up_train = int(y_train.sum())
     down_train = int(len(y_train) - up_train)
-    logger.info("Train target: UP=%d  DOWN=%d", up_train, down_train)
+    logger.info("Train target: UP=%d  DOWN/non-up=%d", up_train, down_train)
 
-    # 5. Build model
+    # 5. Build model (architecture unchanged).
     n_features = len(FEATURE_COLUMNS)
     model = build_lstm_model(n_features, SEQUENCE_LENGTH)
 
-    # 6. Train
-    history = train(model, X_train, y_train, X_test, y_test)
+    # 6. Train (early stopping on validation, never on test).
+    history = train(model, X_train, y_train, X_val, y_val)
 
-    # 7. Evaluate
+    # 7. Final evaluation on the untouched test partition.
     metrics = evaluate(model, X_test, y_test)
 
-    # 8. Save
-    save_artifacts(model, scaler, metrics, history)
+    # 8. Save artifacts (existing paths; no old checkpoints overwritten here).
+    save_artifacts(model, scaler, metrics, history, split_report=split_report)
 
     logger.info("=" * 60)
     logger.info("LSTM TRAINING COMPLETE")

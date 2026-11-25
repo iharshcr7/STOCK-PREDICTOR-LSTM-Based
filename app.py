@@ -1,7 +1,7 @@
 """
 NASDAQ AI Stock Predictor — Streamlit Dashboard
 =================================================
-Premium dark-themed dashboard with live/manual prediction modes,
+Premium dark-themed dashboard with LSTM deep-learning prediction,
 candlestick charts, historical graphs, and confidence scores.
 
 Usage:
@@ -40,13 +40,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import joblib
 from datetime import datetime
-from model_config import FINAL_MODEL_FILE, MODEL_METADATA_FILE, get_expected_features
-from predict_live import predict_live, get_supported_stocks
-from mongo_store import fetch_recent_predictions, save_prediction
+from mongo_store import (
+    fetch_recent_predictions,
+    fetch_lstm_predictions,
+    save_lstm_prediction,
+)
 from fetch_live_data import get_historical_for_chart, compute_live_features
-from symbol_mapper import search_stocks, get_company_name, resolve_symbol
+from symbol_mapper import (
+    search_stocks, get_company_name, resolve_symbol, get_supported_stocks,
+)
 from predict_lstm import (
     predict_lstm_live,
     is_lstm_available,
@@ -57,6 +60,28 @@ from predict_lstm import (
     SEQUENCE_LENGTH as LSTM_SEQUENCE_LENGTH,
     compute_features as compute_lstm_features,
 )
+from lstm_inference import (
+    infer_symbols as infer_symbols_with_existing_lstm,
+    predict_live as predict_live_lstm,
+    to_storage_record as lstm_storage_record,
+)
+from live_prediction_pipeline import (
+    LivePredictionPipeline,
+    coerce_results,
+    summarize_results,
+)
+from stock_intelligence_pipeline import (
+    StockIntelligencePipeline,
+    build_market_payload,
+    classify_coverage,
+    discover_universe,
+    get_spark,
+    normalize_market_payload,
+    normalize_run_result,
+)
+import hdfs_market_store as hdfs_store
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Page Config
@@ -75,51 +100,49 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-.main, .stApp {
-    background: linear-gradient(135deg, #0a0a1a 0%, #111128 50%, #0d0d24 100%);
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+:root {
+    --bg: #0B1220; --surface: #111C2E; --card: #162338;
+    --text: #F1F5F9; --muted: #94A3B8; --up: #22C55E; --down: #EF4444;
+    --accent: #6366F1; --border: rgba(148,163,184,0.18);
+}
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; color: var(--text); }
+.stApp { background: var(--bg); }
+section[data-testid="stSidebar"] {
+    background: var(--surface); border-right: 1px solid var(--border);
 }
 .main-header {
-    text-align: center; padding: 1.5rem 0 1rem 0;
-    background: linear-gradient(135deg, rgba(99,102,241,0.08), rgba(139,92,246,0.08));
-    border-radius: 16px; border: 1px solid rgba(99,102,241,0.15);
-    margin-bottom: 1.5rem;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 1.5rem; padding: 1.25rem 1.5rem; background: var(--card);
+    border: 1px solid var(--border); border-radius: 14px; margin-bottom: 1.5rem;
 }
-.main-header h1 {
-    font-size: 2.4rem; font-weight: 800;
-    background: linear-gradient(135deg, #818cf8, #a78bfa, #c084fc);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin: 0;
+.main-header h1 { font-size: 1.9rem; font-weight: 800; color: var(--text); margin: 0; letter-spacing: -0.4px; }
+.main-header p { color: var(--muted); font-size: 0.9rem; margin: 0.35rem 0 0 0; }
+.header-status { display: flex; gap: 0.6rem; flex-wrap: wrap; justify-content: flex-end; }
+.pill {
+    display: inline-block; padding: 0.4rem 0.75rem; border-radius: 999px;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.4px;
+    border: 1px solid var(--border); background: rgba(148,163,184,0.08); color: var(--muted);
 }
-.main-header p { color: #94a3b8; font-size: 0.95rem; margin: 0.3rem 0 0 0; }
+.pill-good { color: var(--up); border-color: rgba(34,197,94,0.35); background: rgba(34,197,94,0.10); }
+.pill-bad { color: var(--down); border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.10); }
+.pill-accent { color: #A5B4FC; border-color: rgba(99,102,241,0.4); background: rgba(99,102,241,0.12); }
 .metric-card {
-    background: linear-gradient(135deg, rgba(30,30,60,0.9), rgba(20,20,50,0.9));
-    border: 1px solid rgba(99,102,241,0.2); border-radius: 12px;
-    padding: 1.2rem; text-align: center; backdrop-filter: blur(10px);
-    transition: transform 0.2s, border-color 0.2s;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 1.05rem 1rem; text-align: center; transition: border-color .2s, transform .2s;
 }
-.metric-card:hover { transform: translateY(-2px); border-color: rgba(99,102,241,0.5); }
+.metric-card:hover { transform: translateY(-2px); border-color: rgba(99,102,241,0.55); }
 .metric-label {
-    font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 1px; color: #94a3b8; margin-bottom: 0.3rem;
+    font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.9px; color: var(--muted); margin-bottom: 0.45rem;
 }
-.metric-value { font-size: 1.6rem; font-weight: 700; color: #e2e8f0; }
-.pred-up {
-    background: linear-gradient(135deg, rgba(0,200,83,0.15), rgba(0,230,118,0.08));
-    border: 2px solid rgba(0,200,83,0.4); border-radius: 16px;
-    padding: 1.5rem; text-align: center;
-}
-.pred-down {
-    background: linear-gradient(135deg, rgba(255,23,68,0.15), rgba(255,82,82,0.08));
-    border: 2px solid rgba(255,23,68,0.4); border-radius: 16px;
-    padding: 1.5rem; text-align: center;
-}
-.pred-label { font-size: 2rem; font-weight: 800; }
-.pred-conf { font-size: 1rem; color: #94a3b8; margin-top: 0.3rem; }
-section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0f0f2a 0%, #141432 100%);
-    border-right: 1px solid rgba(99,102,241,0.15);
-}
+.metric-value { font-size: 1.55rem; font-weight: 800; color: var(--text); }
+.pred-up, .pred-down { border-radius: 14px; padding: 1.35rem; text-align: center; border: 1px solid; }
+.pred-up { background: rgba(34,197,94,0.10); border-color: rgba(34,197,94,0.45); }
+.pred-down { background: rgba(239,68,68,0.10); border-color: rgba(239,68,68,0.45); }
+.pred-label { font-size: 1.8rem; font-weight: 800; }
+.pred-conf { font-size: 0.95rem; color: var(--muted); margin-top: 0.4rem; }
+.divider { height: 1px; background: var(--border); margin: 1.4rem 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -127,11 +150,7 @@ section[data-testid="stSidebar"] {
 # Constants
 # ---------------------------------------------------------------------------
 
-MODELS_DIR = PROJECT_ROOT / "models"
-MODEL_PATH = FINAL_MODEL_FILE
-FEATURE_COLUMNS = get_expected_features()
-
-# Get supported stocks from predict_live.py (production stocks with full pipeline support)
+# Get supported stocks from the symbol database (stock-selection functionality)
 SUPPORTED_STOCKS_LIST = get_supported_stocks()
 
 # Build dynamic stock dropdown with company names
@@ -161,31 +180,59 @@ for key, value in POPULAR_STOCKS.items():
         STOCKS = {key: value, **STOCKS}
 
 # ---------------------------------------------------------------------------
-# Load Model
+# Infrastructure status (cheap, cached — never starts Spark in this check)
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
-def load_model():
-    if not MODEL_PATH.exists():
-        return None
-    return joblib.load(MODEL_PATH)
+@st.cache_data(ttl=120, show_spinner=False)
+def infrastructure_status() -> dict:
+    status = {"hdfs": False, "mongodb": False, "spark": False, "hadoop_home": ""}
+    try:
+        status["hadoop_home"] = hdfs_store.resolve_hdfs_bin()
+        status["hdfs"] = bool(status["hadoop_home"])
+    except Exception:
+        pass
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(
+            os.environ.get("MONGODB_URI", "mongodb://localhost:27017"),
+            serverSelectionTimeoutMS=1500,
+        )
+        client.admin.command("ping")
+        status["mongodb"] = True
+    except Exception:
+        pass
+    try:
+        import pyspark  # noqa: F401
+        status["spark"] = True
+    except Exception:
+        pass
+    return status
 
-model = load_model()
 
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 
-st.markdown("""
+_model_ok = is_lstm_available()
+_infra = infrastructure_status()
+_monitor_state = st.session_state.get('p5_monitor') or {}
+_last_update = _monitor_state.get('latest_market_data_timestamp') or 'no data yet'
+st.markdown(f"""
 <div class="main-header">
-    <h1>NASDAQ AI Stock Predictor</h1>
-    <p>Hybrid Machine Learning — Structured + Unstructured Data Analysis</p>
+    <div>
+        <h1>NASDAQ AI Stock Predictor</h1>
+        <p>Stock Market Intelligence Engine · existing LSTM inference · model outputs are not investment advice</p>
+    </div>
+    <div class="header-status">
+        <span class="pill {'pill-good' if _model_ok else 'pill-bad'}">MODEL: {'READY' if _model_ok else 'UNAVAILABLE'}</span>
+        <span class="pill pill-accent">MARKET DATA: {'AVAILABLE' if _monitor_state.get('last_successful_fetch') else 'IDLE'}</span>
+        <span class="pill {'pill-good' if _infra['hdfs'] else 'pill-bad'}">HDFS: {'READY' if _infra['hdfs'] else 'OFFLINE'}</span>
+        <span class="pill {'pill-good' if _infra['spark'] else 'pill-bad'}">SPARK: {'READY' if _infra['spark'] else 'OFFLINE'}</span>
+        <span class="pill {'pill-good' if _infra['mongodb'] else 'pill-bad'}">MONGODB: {'READY' if _infra['mongodb'] else 'OFFLINE'}</span>
+        <span class="pill">LAST UPDATE: {_last_update}</span>
+    </div>
 </div>
 """, unsafe_allow_html=True)
-
-if model is None:
-    st.error("Model not found. Run `python scripts/train_model.py` first to train the model.")
-    st.stop()
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -238,20 +285,18 @@ with st.sidebar:
     st.caption(f"Total available stocks: {len(SUPPORTED_STOCKS_LIST):,}")
 
     st.markdown("---")
-    mode = st.radio("Data Source", ["Live Data", "Manual Input"], index=0)
+    mode = st.radio(
+        "Mode", ["Live Data", "Distributed Pipeline", "Spark Processing"], index=0
+    )
 
-    st.markdown("---")
-    st.markdown("### RF Model Info")
-    meta_path = MODEL_METADATA_FILE
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
-        st.metric("Accuracy", f"{meta['metrics']['accuracy']*100:.1f}%")
-        st.metric("ROC AUC", f"{meta['metrics']['roc_auc']:.3f}")
-        st.metric("F1 Score", f"{meta['metrics']['f1_score']:.3f}")
-        st.caption(f"Model: {meta.get('selected_model', meta.get('model_type', 'RandomForest'))}")
-        st.caption(f"Trained: {meta.get('trained_at', 'N/A')[:10]}")
-    else:
-        st.info("Train RF model to see metrics")
+    st.markdown("#### Live Data Source")
+    st.selectbox(
+        "Preferred provider",
+        ["auto", "yfinance", "alpha_vantage", "local"],
+        index=0,
+        key="p5_source",
+        help="auto: Yahoo Finance → Alpha Vantage (free tier) → local historical CSV",
+    )
 
     # -----------------------------------------------------------------------
     # Model availability status
@@ -263,9 +308,7 @@ with st.sidebar:
 
     if lstm_ready:
         st.success("LSTM — ready")
-        st.info("Random Forest — ready")
     else:
-        st.info("Random Forest — ready")
         st.warning("LSTM — not trained")
         st.caption("Run: `python scripts/train_lstm_model.py`")
 
@@ -285,14 +328,6 @@ with st.sidebar:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def predict_direction(features_dict: dict) -> tuple:
-    """Run prediction using the trained model. Returns (direction, confidence, probabilities)."""
-    feature_df = pd.DataFrame([{c: features_dict[c] for c in FEATURE_COLUMNS}])
-    pred = model.predict(feature_df)[0]
-    probs = model.predict_proba(feature_df)[0]
-    return ("UP" if pred == 1 else "DOWN"), float(probs.max()) * 100, probs
-
-
 def render_metric(label: str, value: str, col):
     col.markdown(f"""
     <div class="metric-card">
@@ -311,6 +346,287 @@ def render_prediction(direction: str, confidence: float):
         <div class="pred-label" style="color:{color};">{arrow}</div>
         <div class="pred-conf">Confidence: {confidence:.1f}%</div>
     </div>""", unsafe_allow_html=True)
+
+
+def _chart_frame(chart_data):
+    """Convert a per-symbol chart payload into a DataFrame (empty if unusable)."""
+    if not isinstance(chart_data, dict) or not chart_data.get("Date"):
+        return pd.DataFrame()
+    try:
+        return pd.DataFrame(chart_data)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _style_figure(fig, title, height=320):
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#111C2E",
+        plot_bgcolor="#162338",
+        font=dict(color="#F1F5F9", size=12),
+        title=dict(text=title, x=0.04, font=dict(size=14, color="#F1F5F9")),
+        margin=dict(l=45, r=20, t=55, b=35),
+        height=height,
+    )
+    fig.update_xaxes(gridcolor="rgba(148,163,184,0.12)", showgrid=True)
+    fig.update_yaxes(gridcolor="rgba(148,163,184,0.12)", showgrid=True)
+    return fig
+
+
+def render_symbol_analysis(result):
+    """Render the four required charts for ONE successfully processed symbol."""
+    frame = _chart_frame(getattr(result, "chart_data", None))
+    if frame.empty:
+        st.info("No per-symbol OHLCV payload was captured for this result.")
+        return
+
+    summary_cols = st.columns(5)
+    summary_cols[0].metric("Direction", result.prediction or "-")
+    summary_cols[1].metric("UP probability", f"{result.probabilities.get('UP', 0.0):.2f}%")
+    summary_cols[2].metric("DOWN probability", f"{result.probabilities.get('DOWN', 0.0):.2f}%")
+    summary_cols[3].metric("Confidence", f"{result.confidence:.2f}%")
+    summary_cols[4].metric("Freshness", (result.freshness or {}).get("status", "-"))
+    st.caption(
+        f"Latest session: **{result.market_data_timestamp or '-'}** | "
+        f"Provider: **{result.provider or '-'}** ({result.data_vintage}) | "
+        f"Model output P(UP): **{result.raw_output:.4f}**"
+    )
+
+    safe_key = str(result.symbol).replace(".", "_").replace("-", "_")
+
+    price = go.Figure(go.Scatter(
+        x=frame["Date"], y=frame["Close"], mode="lines",
+        line=dict(color="#818CF8", width=2), name="Close",
+    ))
+    st.plotly_chart(
+        _style_figure(price, f"{result.symbol} — historical closing price"),
+        width="stretch", key=f"p5_price_{safe_key}",
+    )
+
+    candle = go.Figure(go.Candlestick(
+        x=frame["Date"], open=frame["Open"], high=frame["High"],
+        low=frame["Low"], close=frame["Close"], name="OHLC",
+    ))
+    _style_figure(candle, f"{result.symbol} — candlestick")
+    candle.update_layout(xaxis_rangeslider_visible=False)
+    st.plotly_chart(candle, width="stretch", key=f"p5_candle_{safe_key}")
+
+    volume = go.Figure(go.Bar(
+        x=frame["Date"], y=frame["Volume"], marker_color="#475569", name="Volume",
+    ))
+    st.plotly_chart(
+        _style_figure(volume, f"{result.symbol} — traded volume"),
+        width="stretch", key=f"p5_volume_{safe_key}",
+    )
+
+    probability = go.Figure(go.Bar(
+        x=["UP", "DOWN"],
+        y=[result.probabilities.get("UP", 0.0), result.probabilities.get("DOWN", 0.0)],
+        marker_color=["#22C55E", "#EF4444"],
+        text=[f"{result.probabilities.get('UP', 0.0):.2f}%", f"{result.probabilities.get('DOWN', 0.0):.2f}%"],
+        textposition="outside",
+    ))
+    st.plotly_chart(
+        _style_figure(probability, f"{result.symbol} — model probability (binary LSTM)"),
+        width="stretch", key=f"p5_prob_{safe_key}",
+    )
+    st.caption(
+        f"Historical context: {len(frame)} sessions shown · latest session "
+        f"{frame['Date'].iloc[-1]} · current prediction is a single model output, "
+        "not a fabricated historical prediction series."
+    )
+
+
+def _ensure_analytics_indicators(frame: pd.DataFrame) -> pd.DataFrame:
+    """Compute derived technical indicators from Close if not already present."""
+    df = frame.copy()
+    close = df["Close"]
+    if "MA20" not in df.columns:
+        df["MA20"] = close.rolling(20, min_periods=20).mean()
+    if "SMA50" not in df.columns:
+        df["SMA50"] = close.rolling(50, min_periods=50).mean()
+    if "SMA200" not in df.columns:
+        df["SMA200"] = close.rolling(200, min_periods=200).mean()
+    if "RSI" not in df.columns:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14, min_periods=14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df["RSI"] = 100.0 - (100.0 / (1.0 + rs))
+    if "MACD" not in df.columns or "MACD_Signal" not in df.columns:
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        df["MACD"] = ema12 - ema26
+        df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    if "BB_Upper" not in df.columns or "BB_Lower" not in df.columns:
+        ma20 = df["MA20"]
+        std20 = close.rolling(20, min_periods=20).std()
+        df["BB_Upper"] = ma20 + 2.0 * std20
+        df["BB_Lower"] = ma20 - 2.0 * std20
+    if "Daily_Returns" not in df.columns:
+        df["Daily_Returns"] = close.pct_change() * 100.0
+    return df
+
+
+def _derive_latest_metrics(frame: pd.DataFrame, metadata: dict) -> dict:
+    """Use preserved latest_metrics or derive them from the normalized OHLCV frame."""
+    existing = metadata.get("latest_metrics")
+    if isinstance(existing, dict) and existing:
+        return existing
+    last = frame.iloc[-1]
+    prev_close = float(frame["Close"].iloc[-2]) if len(frame) > 1 else None
+    latest_close = float(last["Close"]) if pd.notna(last.get("Close")) else None
+    return {
+        "date": str(last["Date"].date()) if hasattr(last["Date"], "date") else str(last["Date"]),
+        "open": float(last["Open"]) if pd.notna(last.get("Open")) else None,
+        "high": float(last["High"]) if pd.notna(last.get("High")) else None,
+        "low": float(last["Low"]) if pd.notna(last.get("Low")) else None,
+        "close": latest_close,
+        "adj_close": float(last["Adj Close"]) if "Adj Close" in frame.columns and pd.notna(last.get("Adj Close")) else None,
+        "volume": float(last["Volume"]) if "Volume" in frame.columns and pd.notna(last.get("Volume")) else None,
+        "previous_close": prev_close,
+        "daily_change": (latest_close - prev_close) if (latest_close and prev_close) else None,
+        "daily_change_pct": ((latest_close / prev_close - 1.0) * 100.0 if (latest_close and prev_close) else None),
+    }
+
+
+def render_market_analytics(payload: dict | list | pd.DataFrame, prediction: dict | None = None):
+    """Render the complete interactive OHLCV + indicator analytics for one symbol."""
+    target_symbol = (prediction or {}).get("symbol")
+    frame, metadata = normalize_market_payload(payload, symbol=target_symbol)
+
+    if frame.empty:
+        reason = metadata.get("validation_error") or "No valid processed OHLCV data is available for this symbol."
+        st.warning(f"Market analytics unavailable: {reason}")
+        return
+
+    # Keep individual stock datasets separate if a multi-symbol frame is passed
+    if "Symbol" in frame.columns and frame["Symbol"].nunique(dropna=True) > 1:
+        if target_symbol and (frame["Symbol"] == target_symbol).any():
+            frame = frame.loc[frame["Symbol"] == target_symbol].sort_values("Date").reset_index(drop=True)
+        else:
+            first_symbol = str(frame["Symbol"].dropna().iloc[0])
+            frame = frame.loc[frame["Symbol"] == first_symbol].sort_values("Date").reset_index(drop=True)
+            metadata["symbol"] = first_symbol
+
+    frame = _ensure_analytics_indicators(frame)
+    symbol = metadata.get("symbol") or target_symbol or "SYMBOL"
+    metrics = _derive_latest_metrics(frame, metadata)
+    safe_key = str(symbol).replace(".", "_").replace("-", "_")
+    logger.info(
+        "Rendering market analytics: symbol=%s source=%s records=%d columns=%s",
+        symbol, metadata.get("source", "hdfs_parquet"), len(frame), list(frame.columns),
+    )
+
+    st.markdown(f"#### {symbol} — latest completed session: {metrics.get('date', '-')}")
+    cols = st.columns(5)
+    labels = [
+        ("Open", metrics.get("open")), ("High", metrics.get("high")),
+        ("Low", metrics.get("low")), ("Close", metrics.get("close")),
+        ("Volume", metrics.get("volume")),
+    ]
+    for col, (label, value) in zip(cols, labels):
+        col.metric(label, "-" if value is None else f"{value:,.2f}")
+
+    cols2 = st.columns(5)
+    extra = [
+        ("Adj Close", metrics.get("adj_close")),
+        ("Previous Close", metrics.get("previous_close")),
+        ("Daily Change", metrics.get("daily_change")),
+        ("Daily Change %", metrics.get("daily_change_pct")),
+        ("Sessions", len(frame)),
+    ]
+    for col, (label, value) in zip(cols2, extra):
+        col.metric(
+            label,
+            "-" if value is None else (f"{value:,.0f}" if label == "Sessions" else f"{value:,.2f}"),
+        )
+
+    if prediction and prediction.get("ok"):
+        pcols = st.columns(4)
+        pcols[0].metric("Direction", prediction.get("prediction", "-"))
+        pcols[1].metric("P(UP)", f"{prediction.get('probabilities', {}).get('UP', 0):.2f}%")
+        pcols[2].metric("P(DOWN)", f"{prediction.get('probabilities', {}).get('DOWN', 0):.2f}%")
+        pcols[3].metric("Model P(UP)", f"{prediction.get('raw_output', 0):.4f}")
+        st.caption(
+            f"Model: {prediction.get('model_id', 'lstm_model.keras')} | "
+            f"Prediction time: {prediction.get('prediction_timestamp', '-')} | "
+            f"Input session: {prediction.get('input_data_timestamp', '-')} | "
+            f"Source: {prediction.get('source', 'hdfs_parquet')}"
+        )
+        st.caption("Model output — not guaranteed investment advice.")
+
+    candle = go.Figure(go.Candlestick(
+        x=frame["Date"], open=frame["Open"], high=frame["High"],
+        low=frame["Low"], close=frame["Close"], name="OHLC",
+    ))
+    _style_figure(candle, f"{symbol} — candlestick (OHLC)", 360)
+    candle.update_layout(xaxis_rangeslider_visible=False)
+    st.plotly_chart(candle, width="stretch", key=f"p52_candle_{safe_key}")
+
+    line = go.Figure()
+    line.add_trace(go.Scatter(x=frame["Date"], y=frame["Close"], name="Close",
+                              line=dict(color="#F1F5F9", width=2)))
+    for col, color in (("MA20", "#6366F1"), ("SMA50", "#F59E0B"), ("SMA200", "#22C55E")):
+        if col in frame.columns and frame[col].notna().any():
+            line.add_trace(go.Scatter(x=frame["Date"], y=frame[col], name=col,
+                                      line=dict(color=color, width=1.4)))
+    st.plotly_chart(_style_figure(line, f"{symbol} — close & moving averages", 340),
+                    width="stretch", key=f"p52_line_{safe_key}")
+
+    if "Volume" in frame.columns and frame["Volume"].notna().any():
+        volume = go.Figure(go.Bar(x=frame["Date"], y=frame["Volume"],
+                                  marker_color="#475569", name="Volume"))
+        st.plotly_chart(_style_figure(volume, f"{symbol} — trading volume", 280),
+                        width="stretch", key=f"p52_volume_{safe_key}")
+
+    if "RSI" in frame.columns and frame["RSI"].notna().any():
+        rsi = go.Figure(go.Scatter(x=frame["Date"], y=frame["RSI"],
+                                   line=dict(color="#818CF8"), name="RSI(14)"))
+        rsi.add_hline(y=70, line_dash="dash", line_color="#EF4444")
+        rsi.add_hline(y=30, line_dash="dash", line_color="#22C55E")
+        st.plotly_chart(_style_figure(rsi, f"{symbol} — RSI(14)", 260),
+                        width="stretch", key=f"p52_rsi_{safe_key}")
+
+    if "MACD" in frame.columns and frame["MACD"].notna().any():
+        macd = go.Figure()
+        macd.add_trace(go.Scatter(x=frame["Date"], y=frame["MACD"],
+                                  name="MACD", line=dict(color="#6366F1")))
+        if "MACD_Signal" in frame.columns and frame["MACD_Signal"].notna().any():
+            macd.add_trace(go.Scatter(x=frame["Date"], y=frame["MACD_Signal"],
+                                      name="Signal", line=dict(color="#F59E0B")))
+        st.plotly_chart(_style_figure(macd, f"{symbol} — MACD", 260),
+                        width="stretch", key=f"p52_macd_{safe_key}")
+
+    if "BB_Upper" in frame.columns and frame["BB_Upper"].notna().any():
+        bb = go.Figure()
+        bb.add_trace(go.Scatter(x=frame["Date"], y=frame["Close"], name="Close",
+                                line=dict(color="#F1F5F9", width=1.6)))
+        bb.add_trace(go.Scatter(x=frame["Date"], y=frame["BB_Upper"], name="Upper",
+                                line=dict(color="#6366F1", dash="dash")))
+        if "BB_Lower" in frame.columns and frame["BB_Lower"].notna().any():
+            bb.add_trace(go.Scatter(x=frame["Date"], y=frame["BB_Lower"], name="Lower",
+                                    line=dict(color="#6366F1", dash="dash")))
+        st.plotly_chart(_style_figure(bb, f"{symbol} — Bollinger Bands", 300),
+                        width="stretch", key=f"p52_bb_{safe_key}")
+
+    if "Daily_Returns" in frame.columns and frame["Daily_Returns"].notna().any():
+        hist = go.Figure(go.Histogram(x=frame["Daily_Returns"].dropna(), nbinsx=40,
+                                      marker_color="#475569"))
+        st.plotly_chart(_style_figure(hist, f"{symbol} — daily returns distribution", 260),
+                        width="stretch", key=f"p52_returns_{safe_key}")
+
+    if prediction and prediction.get("ok"):
+        prob = go.Figure(go.Bar(
+            x=["DOWN", "UP"],
+            y=[prediction["probabilities"]["DOWN"], prediction["probabilities"]["UP"]],
+            marker_color=["#EF4444", "#22C55E"],
+            text=[f"{prediction['probabilities']['DOWN']:.2f}%",
+                  f"{prediction['probabilities']['UP']:.2f}%"],
+            textposition="outside",
+        ))
+        st.plotly_chart(_style_figure(prob, f"{symbol} — model probability", 280),
+                        width="stretch", key=f"p52_prob_{safe_key}")
 
 
 def make_candlestick(df, title):
@@ -710,7 +1026,7 @@ def run_lstm_backtest(hist_df: pd.DataFrame, symbol: str):
         
     try:
         # 1. Compute features using predict_lstm feature pipeline
-        df_feat = compute_lstm_features(hist_df)
+        df_feat = compute_lstm_features(hist_df, symbol=symbol)
         df_feat = df_feat.dropna(subset=LSTM_FEATURE_COLUMNS).copy()
         
         if len(df_feat) < LSTM_SEQUENCE_LENGTH + 1:
@@ -1080,98 +1396,253 @@ if mode == "Live Data":
     st.markdown("---")
 
     # ── Options row ──────────────────────────────────────────────────────────
-    col_src, col_hdfs, col_mongo = st.columns(3)
-    with col_src:
-        data_source = st.selectbox(
-            "Data Source",
-            ["auto", "alpha_vantage", "yfinance"],
-            index=0,
-            help="auto: tries Alpha Vantage first, falls back to Yahoo Finance"
-        )
-    with col_hdfs:
-        skip_hdfs = st.checkbox("Skip HDFS", value=True,
-                                help="Uncheck only if Hadoop is running")
-    with col_mongo:
-        skip_mongo = st.checkbox("Skip MongoDB", value=False)
+    data_source = st.selectbox(
+        "Data Source",
+        ["auto", "alpha_vantage", "yfinance"],
+        index=0,
+        help="auto: tries Alpha Vantage first, falls back to Yahoo Finance"
+    )
 
     st.markdown("")
 
-    # ── Two predict buttons side by side ─────────────────────────────────────
-    col_rf_btn, col_lstm_btn = st.columns(2)
-    with col_rf_btn:
-        rf_button = st.button(
-            "Predict with Random Forest",
-            type="primary",
-            use_container_width=True,
-            help="Predict using Random Forest — uses 21 technical indicator features"
-        )
-    with col_lstm_btn:
-        lstm_button = st.button(
-            "Predict with LSTM",
-            type="primary" if lstm_ready else "secondary",
-            use_container_width=True,
-            disabled=not lstm_ready,
-            help="Predict using LSTM — uses 60-day sequence of historical data"
-            if lstm_ready else "Train LSTM first: python scripts/train_lstm_model.py"
-        )
+    # ── LSTM prediction button ───────────────────────────────────────────────
+    lstm_button = st.button(
+        "Predict with LSTM",
+        type="primary" if lstm_ready else "secondary",
+        width="stretch",
+        disabled=not lstm_ready,
+        help="Predict using LSTM — uses 60-day sequence of historical data"
+        if lstm_ready else "Train LSTM first: python scripts/train_lstm_model.py"
+    )
 
     st.markdown("---")
 
     api_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
 
-    # ── RF Button clicked ─────────────────────────────────────────────────────
-    if rf_button:
-        # Clear any previous results so stale data never shows
-        for k in ['rf_result', 'rf_hist_df', 'lstm_result', 'active_model']:
-            st.session_state.pop(k, None)
-
-        with st.spinner(f"Running Random Forest prediction for {symbol}..."):
-            progress_bar = st.progress(0)
-            status_text  = st.empty()
-            try:
-                status_text.text("Fetching live data...")
-                progress_bar.progress(25)
-                status_text.text("Saving CSV & uploading to HDFS...")
-                progress_bar.progress(50)
-                status_text.text("Engineering features...")
-                progress_bar.progress(75)
-                status_text.text("Running Random Forest...")
-                progress_bar.progress(90)
-
-                rf_res = predict_live(
-                    symbol=symbol, source=data_source,
-                    api_key=api_key, save_to_db=not skip_mongo,
-                    skip_hdfs=skip_hdfs
-                )
-                progress_bar.progress(100)
-                status_text.text("Done!")
-
-                hist_df = get_historical_for_chart(symbol=symbol, api_key=api_key, source=data_source)
-                if hist_df is not None and not hist_df.empty:
+    # ── Multi-stock inference (Phase 4) ──────────────────────────────────────
+    # Reuses the same cached LSTM; every symbol is validated independently and
+    # incompatible symbols are reported instead of producing misleading output.
+    with st.expander("Multi-Stock Inference (existing LSTM)", expanded=False):
+        st.caption(
+            "Run the already-trained LSTM on several symbols. Each symbol is "
+            "checked for sufficient history, feature compatibility and scaling "
+            "compatibility before a prediction is produced."
+        )
+        batch_input = st.text_input(
+            "Symbols (comma-separated)",
+            value="AAPL,MSFT,NVDA",
+            key="lstm_batch_symbols",
+        )
+        if st.button("Run batch inference", key="lstm_batch_button"):
+            batch_symbols = [s.strip().upper() for s in batch_input.split(",") if s.strip()]
+            if not batch_symbols:
+                st.warning("Enter at least one stock symbol.")
+            else:
+                with st.spinner(f"Running inference for {len(batch_symbols)} symbol(s)..."):
                     try:
-                        hist_df = compute_live_features(hist_df)
-                    except Exception as he:
-                        logger.warning(f"Could not compute features on hist_df: {he}")
-                st.session_state['rf_result']   = rf_res
-                st.session_state['rf_hist_df']  = hist_df
-                st.session_state['active_model'] = 'rf'
-                if rf_res.get('spark_ui_url'):
-                    st.session_state['spark_ui_url'] = rf_res.get('spark_ui_url')
+                        batch_results = infer_symbols_with_existing_lstm(
+                            batch_symbols, source=data_source, api_key=api_key
+                        )
+                        st.session_state['lstm_batch_results'] = batch_results
+                        stored_count = 0
+                        for batch_res in batch_results:
+                            if batch_res.get("ok"):
+                                try:
+                                    if save_lstm_prediction(lstm_storage_record(batch_res)):
+                                        stored_count += 1
+                                except Exception as store_exc:
+                                    logger.warning("Batch prediction storage failed: %s", store_exc)
+                        st.caption(f"Stored {stored_count} new prediction(s) in MongoDB.")
+                    except Exception as batch_exc:
+                        st.error(f"Batch inference failed: {batch_exc}")
 
-            except Exception as e:
-                st.error(f"RF prediction failed: {e}")
-            finally:
-                progress_bar.empty()
-                status_text.empty()
+        batch_results = st.session_state.get('lstm_batch_results', [])
+        if batch_results:
+            batch_rows = [{
+                "Symbol": r.get("symbol"),
+                "Status": "OK" if r.get("ok") else "SKIPPED",
+                "Direction": r.get("prediction") or "-",
+                "UP Probability (%)": r.get("probabilities", {}).get("UP", 0.0),
+                "Confidence (%)": r.get("confidence", 0.0),
+                "Next Return (%)": (
+                    "n/a" if r.get("predicted_next_return_pct") is None
+                    else r.get("predicted_next_return_pct")
+                ),
+                "Notes": "; ".join(r.get("errors", []) or r.get("warnings", [])),
+            } for r in batch_results]
+            st.dataframe(pd.DataFrame(batch_rows), width="stretch", hide_index=True)
+
+    # ── Phase 5 — automated live market-data pipeline ────────────────────────
+    st.markdown("---")
+    st.markdown(
+        "### Live Market Data Pipeline "
+        "<span style='font-size:0.75rem;color:#94a3b8;'>— automated</span>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Fresh OHLCV data → validation → the existing cached LSTM → MongoDB. "
+        "Model output only — not investment advice."
+    )
+    with st.expander("Configure & run live pipeline", expanded=False):
+        p5_provider = st.session_state.get("p5_source", "auto")
+        pcol1, pcol2, pcol3 = st.columns(3)
+        pcol1.metric("Provider (sidebar)", p5_provider)
+        p5_ttl = pcol2.number_input(
+            "Cache TTL (seconds)", min_value=30, max_value=86400, value=900, step=30,
+            key="p5_ttl", help="Reuse recent data instead of repeating API requests",
+        )
+        p5_freshness = pcol3.number_input(
+            "Freshness limit (days)", min_value=1, max_value=14, value=4,
+            key="p5_freshness", help="Older data is labelled stale, never presented as fresh",
+        )
+        p5_ticker = st.text_input("Ticker(s)", value=symbol, key="p5_ticker_input").strip().upper()
+
+        # Widget keys and result keys MUST differ: reusing a widget key for
+        # results makes Streamlit write a bool into the result on the next
+        # rerun, which previously caused "'bool' object is not iterable".
+        run_col1, run_col2, run_col3 = st.columns(3)
+        p5_run = run_col1.button("Run live prediction", key="p5_run_btn")
+        p5_refresh = run_col2.button("Refresh market data", key="p5_refresh_btn")
+        p5_batch = run_col3.button("Run multi-stock pipeline", key="p5_batch_btn")
+
+        if p5_run or p5_refresh or p5_batch:
+            pipeline = LivePredictionPipeline(
+                source=p5_provider,
+                api_key=api_key,
+                freshness_max_days=int(p5_freshness),
+                cache_ttl_seconds=float(p5_ttl),
+                min_request_interval=1.0,
+            )
+            with st.spinner("Running live pipeline (validation + existing LSTM)..."):
+                try:
+                    if p5_batch:
+                        batch_symbols = [
+                            s.strip().upper() for s in p5_ticker.split(",") if s.strip()
+                        ]
+                        st.session_state['p5_batch_results'] = coerce_results(
+                            pipeline.run_many(
+                                batch_symbols, force_refresh=p5_refresh, max_workers=2
+                            )
+                        )
+                        st.session_state['p5_last_result'] = None
+                    else:
+                        st.session_state['p5_last_result'] = pipeline.run_single(
+                            p5_ticker, force_refresh=p5_refresh
+                        )
+                        st.session_state['p5_batch_results'] = []
+                    st.session_state['p5_monitor_snapshot'] = pipeline.monitor.snapshot()
+                except Exception as p5_exc:
+                    logger.exception("Live pipeline failed")
+                    st.error(f"Live pipeline failed: {p5_exc}")
+
+    p5_single = st.session_state.get('p5_last_result')
+    if p5_single is not None and not isinstance(p5_single, bool):
+        freshness = p5_single.freshness or {}
+        status = p5_single.status
+        if status == "success":
+            st.success(f"Pipeline status: {status} — prediction below uses validated data.")
+        elif status == "stale_data":
+            st.warning("Pipeline status: stale data — prediction is NOT fresh.")
+        else:
+            st.error(f"Pipeline status: {status} — no reliable prediction was produced.")
+
+        st.markdown(
+            "**Model prediction (not investment advice):** "
+            f"{p5_single.prediction or 'unavailable'}"
+        )
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("UP probability", f"{p5_single.probabilities.get('UP', 0.0):.2f}%")
+        pc2.metric("DOWN probability", f"{p5_single.probabilities.get('DOWN', 0.0):.2f}%")
+        pc3.metric("Freshness", str(freshness.get("status", "-")))
+        st.caption(
+            f"Provider: **{p5_single.provider or '-'}** ({p5_single.data_vintage}) | "
+            f"Market data timestamp: **{p5_single.market_data_timestamp or '-'}** | "
+            f"Prediction timestamp: **{p5_single.prediction_timestamp or '-'}** | "
+            f"Data age: **{freshness.get('age_days', '-')} day(s)**"
+        )
+        st.caption(
+            f"Market session: **{p5_single.market_session.get('phase', '-')}** | "
+            f"Compatibility: **{p5_single.compatibility_status}** | "
+            f"Model: **{p5_single.model_sha256[:12] if p5_single.model_sha256 else '-'}** | "
+            f"Persisted: **{'yes' if p5_single.persisted else 'no'}**"
+        )
+        for p5_warning in p5_single.warnings:
+            st.warning(p5_warning)
+        for p5_error in p5_single.errors:
+            st.error(p5_error)
+        if p5_single.success and getattr(p5_single, "chart_data", None):
+            with st.expander(f"{p5_single.symbol} — price & probability charts", expanded=False):
+                render_symbol_analysis(p5_single)
+
+    p5_batch_results = coerce_results(st.session_state.get('p5_batch_results'))
+    if p5_batch_results:
+        summary = summarize_results(p5_batch_results)
+        st.markdown("**Multi-stock pipeline status**")
+        st.caption(
+            f"{summary['successful']} succeeded · {summary['failed']} failed · "
+            f"{'partial success' if summary['partial_success'] else 'complete result'}"
+        )
+        p5_rows = [{
+            "Symbol": r.symbol,
+            "Status": r.status,
+            "Direction": r.prediction or "-",
+            "UP (%)": r.probabilities.get("UP", 0.0),
+            "DOWN (%)": r.probabilities.get("DOWN", 0.0),
+            "Confidence (%)": r.confidence,
+            "Next Return": "n/a",
+            "Provider": r.provider or "-",
+            "Freshness": (r.freshness or {}).get("status", "-"),
+            "Data time": r.market_data_timestamp or "-",
+            "Persisted": "yes" if r.persisted else "no",
+            "Notes": "; ".join(r.errors or r.warnings),
+        } for r in p5_batch_results]
+        st.dataframe(pd.DataFrame(p5_rows), width="stretch", hide_index=True)
+
+        successful = [r for r in p5_batch_results if r.success]
+        if successful:
+            st.markdown("#### Multi-Stock Analysis")
+            tabs = st.tabs(["Overview"] + [r.symbol for r in successful])
+            tabs[0].caption(
+                "Select a stock tab to see that symbol's own OHLCV charts and "
+                "prediction probabilities. Failed symbols have no charts."
+            )
+            for failed in [r for r in p5_batch_results if not r.success]:
+                tabs[0].error(f"{failed.symbol}: {'; '.join(failed.errors) or failed.status}")
+            for tab, result in zip(tabs[1:], successful):
+                with tab:
+                    render_symbol_analysis(result)
+        else:
+            for failed in p5_batch_results:
+                st.error(f"{failed.symbol}: {'; '.join(failed.errors) or failed.status}")
+
+    p5_monitor = st.session_state.get('p5_monitor_snapshot')
+    if p5_monitor:
+        with st.expander("Pipeline monitoring", expanded=False):
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("API failures", p5_monitor.get("api_failures", 0))
+            mc2.metric("Rate-limit errors", p5_monitor.get("rate_limit_errors", 0))
+            mc3.metric("Validation failures", p5_monitor.get("validation_failures", 0))
+            mc4.metric("MongoDB failures", p5_monitor.get("mongo_failures", 0))
+            st.caption(
+                f"Last successful fetch: {p5_monitor.get('last_successful_fetch')} | "
+                f"Last successful inference: {p5_monitor.get('last_successful_inference')} | "
+                f"Latest market data: {p5_monitor.get('latest_market_data_timestamp')}"
+            )
+            per_symbol = p5_monitor.get("per_symbol_status") or {}
+            if per_symbol:
+                st.dataframe(
+                    pd.DataFrame(per_symbol).T, width="stretch", hide_index=True
+                )
+            st.caption("Run the CLI with --schedule for unattended polling; Streamlit never auto-starts a background loop.")
 
     # ── LSTM Button clicked ───────────────────────────────────────────────────
     if lstm_button and lstm_ready:
-        for k in ['rf_result', 'rf_hist_df', 'lstm_result', 'lstm_backtest', 'lstm_accuracy', 'active_model']:
+        for k in ['chart_df', 'lstm_result', 'lstm_backtest', 'lstm_accuracy', 'active_model']:
             st.session_state.pop(k, None)
 
         with st.spinner(f"Running LSTM prediction for {symbol} (60-day sequence)..."):
             try:
-                lstm_res = predict_lstm_live(symbol=symbol, source=data_source, api_key=api_key)
+                lstm_res = predict_live_lstm(symbol=symbol, source=data_source, api_key=api_key)
                 hist_df  = get_historical_for_chart(symbol=symbol, api_key=api_key, source=data_source, period="1y")
                 backtest_df = pd.DataFrame()
                 backtest_acc = 0.0
@@ -1182,228 +1653,35 @@ if mode == "Live Data":
                         backtest_df, backtest_acc = run_lstm_backtest(hist_df, symbol)
                     except Exception as he:
                         logger.warning(f"Could not compute features or backtest: {he}")
-                st.session_state['lstm_result']  = lstm_res
-                st.session_state['rf_hist_df']   = hist_df
-                st.session_state['lstm_backtest'] = backtest_df
-                st.session_state['lstm_accuracy'] = backtest_acc
-                st.session_state['active_model'] = 'lstm'
+                if not lstm_res.get("ok", True):
+                    st.error(
+                        "LSTM inference was not run: "
+                        + "; ".join(lstm_res.get("errors", []))
+                    )
+                else:
+                    st.session_state['lstm_result']  = lstm_res
+                    st.session_state['chart_df']     = hist_df
+                    st.session_state['lstm_backtest'] = backtest_df
+                    st.session_state['lstm_accuracy'] = backtest_acc
+                    st.session_state['active_model'] = 'lstm'
+
+                    # Persist the inference result (deduplicated, non-blocking).
+                    try:
+                        st.session_state['lstm_mongo_id'] = save_lstm_prediction(
+                            lstm_storage_record(lstm_res)
+                        )
+                    except Exception as store_exc:
+                        logger.warning("LSTM prediction storage failed: %s", store_exc)
             except Exception as e:
                 st.error(f"LSTM prediction failed: {e}")
 
     # ── Display results ───────────────────────────────────────────────────────
     active_model = st.session_state.get('active_model')
 
-    # ── RF Results ────────────────────────────────────────────────────────────
-    if active_model == 'rf' and 'rf_result' in st.session_state:
-        result  = st.session_state['rf_result']
-        hist_df = st.session_state.get('rf_hist_df')
-
-        # Pipeline status
-        st.markdown("### Pipeline Status")
-        cs1, cs2, cs3, cs4 = st.columns(4)
-        with cs1:
-            st.metric("Data Source", result['source'].upper(),
-                      delta="Live API" if result['source'] in ['alpha_vantage','yfinance'] else None)
-        with cs2:
-            st.metric("CSV Dump", "Saved" if result.get('local_csv_path') else "Failed")
-            if result.get('local_csv_path'):
-                st.caption(f"File: {Path(result['local_csv_path']).name}")
-        with cs3:
-            if result.get('hdfs_uploaded'):
-                st.metric("HDFS Upload", "Uploaded")
-                st.caption("Path: /stock_data/live_api_dumps/")
-            elif skip_hdfs:
-                st.metric("HDFS Upload", "Skipped")
-            else:
-                st.metric("HDFS Upload", "Failed")
-        with cs4:
-            mongo_status = "Saved" if result.get('mongo_id') else ("Skipped" if skip_mongo else "Failed")
-            st.metric("MongoDB", mongo_status)
-            if result.get('mongo_id'):
-                st.caption(f"ID: {result['mongo_id'][:12]}...")
-
-        # Spark UI Availability Panel
-        spark_ui_url = st.session_state.get('spark_ui_url') or result.get('spark_ui_url')
-        if spark_ui_url:
-            st.markdown("""
-            <div style="background-color: #0d2a1d; border-left: 5px solid #10b981; padding: 12px 16px; border-radius: 4px; color: #34d399; font-weight: 600; font-size: 0.95rem; margin-top: 15px; margin-bottom: 20px;">
-            Spark UI Available
-            </div>
-            """, unsafe_allow_html=True)
-            
-            col_ui1, col_ui2, col_ui3, col_ui4 = st.columns(4)
-            with col_ui1:
-                st.markdown(f"**[Overview]({spark_ui_url})**")
-                st.caption("Main dashboard")
-                st.caption("Spark UI will remain available for 5 minutes after processing completes")
-                
-                from urllib.parse import urlparse
-                try:
-                    parsed_url = urlparse(spark_ui_url)
-                    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                except Exception:
-                    base_url = spark_ui_url
-                st.caption(f"Base URL: [{base_url}]({spark_ui_url})")
-                
-            with col_ui2:
-                st.markdown(f"**[Jobs]({spark_ui_url}/jobs/)**")
-                st.caption("All Spark jobs")
-                
-            with col_ui3:
-                st.markdown(f"**[Stages]({spark_ui_url}/stages/)**")
-                st.caption("Stage execution")
-                
-            with col_ui4:
-                st.markdown(f"**[Storage]({spark_ui_url}/storage/)**")
-                st.caption("RDD storage")
-                
-            st.markdown("")
-            with st.expander("More Spark UI Pages"):
-                col_more1, col_more2 = st.columns(2)
-                with col_more1:
-                    st.markdown("Monitoring:")
-                    st.markdown(f"- [Environment]({spark_ui_url}/environment/) - Spark configuration")
-                    st.markdown(f"- [Executors]({spark_ui_url}/executors/) - Executor metrics")
-                    st.markdown(f"- [SQL]({spark_ui_url}/SQL/) - SQL query execution")
-                with col_more2:
-                    st.markdown("Analysis:")
-                    st.markdown(f"- [Stages]({spark_ui_url}/stages/) - View completed stages")
-                    st.markdown(f"- [Jobs]({spark_ui_url}/jobs/) - Click any job to see DAG")
-                    st.markdown(f"- [Storage]({spark_ui_url}/storage/) - Cached data")
-
-        st.markdown("---")
-
-        # Quote
-        st.markdown("### Latest Quote Data")
-        q = result["quote"]
-        qc1, qc2, qc3, qc4, qc5 = st.columns(5)
-        render_metric("Open",   f"${q['open']:.2f}",   qc1)
-        render_metric("High",   f"${q['high']:.2f}",   qc2)
-        render_metric("Low",    f"${q['low']:.2f}",    qc3)
-        render_metric("Close",  f"${q['close']:.2f}",  qc4)
-        render_metric("Volume", f"{q['volume']:,}",     qc5)
-
-        st.markdown("")
-
-        # Prediction
-        st.markdown("### Prediction Result  <span style='font-size:0.75rem;color:#94a3b8;'>— Random Forest</span>", unsafe_allow_html=True)
-        render_prediction(result["prediction"], result["confidence"])
-        st.markdown("")
-        pc1, pc2, pc3 = st.columns(3)
-        pc1.metric("DOWN Probability", f"{result['probabilities']['DOWN']:.2f}%")
-        pc2.metric("UP Probability",   f"{result['probabilities']['UP']:.2f}%")
-        pc3.metric("Confidence", f"{result['confidence']:.2f}%",
-                   delta="High" if result['confidence'] > 80 else ("Medium" if result['confidence'] > 60 else "Low"))
-        st.markdown("")
-        st.caption(
-            f"Latest Trading Day: **{result['latest_date']}** | "
-            f"Model: **{Path(result['model_file']).name}** | "
-            f"Features: **{result['feature_count']}** | "
-            f"Timestamp: **{result['timestamp'][:19]}**"
-        )
-
-        st.markdown("---")
-
-        # Charts
-        if hist_df is not None and not hist_df.empty:
-            st.markdown("### Live Market Visualizations")
-            st.markdown("#### Price Action & Volume Analysis")
-            cc1, cc2 = st.columns([2, 1])
-            with cc1:
-                st.plotly_chart(make_candlestick(hist_df, f"{symbol} — Candlestick Chart"),
-                                use_container_width=True, key="rf_candle")
-            with cc2:
-                st.plotly_chart(create_volume_chart(hist_df, symbol),
-                                use_container_width=True, key="rf_volume")
-            st.markdown("")
-            st.markdown("#### Price Trend Analysis")
-            st.plotly_chart(make_close_chart(hist_df, f"{symbol} — Close Price Trend"),
-                            use_container_width=True, key="rf_close")
-            st.markdown("")
-            st.markdown("#### Technical Indicator Correlations")
-            st.plotly_chart(create_correlation_heatmap(hist_df, result.get("features"), window=50),
-                            use_container_width=True, key="rf_heatmap")
-            st.markdown("")
-            st.markdown("#### Daily Returns Distribution")
-            st.plotly_chart(create_returns_histogram(hist_df, symbol, window=100),
-                            use_container_width=True, key="rf_returns")
-
-        st.markdown("---")
-
-        # RF Model info expander
-        with st.expander("Feature Values Used for Prediction"):
-            feat_df = pd.DataFrame([result["features"]])
-            st.dataframe(feat_df.T.rename(columns={0: "Value"}).style.format("{:.6f}"),
-                         use_container_width=True)
-
-        with st.expander("Model Information"):
-            mi1, mi2 = st.columns(2)
-            with mi1:
-                st.markdown("**Model Details:**")
-                st.write(f"- Model File: `{Path(result['model_file']).name}`")
-                st.write(f"- Model Type: Random Forest")
-                st.write(f"- Features Used: {result['feature_count']}")
-                if MODEL_METADATA_FILE.exists():
-                    _m = json.loads(MODEL_METADATA_FILE.read_text())
-                    st.write(f"- Training Accuracy: {_m['metrics']['accuracy']*100:.2f}%")
-                    st.write(f"- ROC AUC: {_m['metrics']['roc_auc']:.4f}")
-                    st.write(f"- F1 Score: {_m['metrics']['f1_score']:.4f}")
-            with mi2:
-                st.markdown("**Prediction Details:**")
-                st.write(f"- Symbol: {result['symbol']}")
-                st.write(f"- Prediction: {result['prediction']}")
-                st.write(f"- Confidence: {result['confidence']:.2f}%")
-                st.write(f"- Data Source: {result['source']}")
-                st.write(f"- Latest Date: {result['latest_date']}")
-                st.write(f"- Timestamp: {result['timestamp'][:19]}")
-
-        with st.expander("Data Storage Information"):
-            ds1, ds2 = st.columns(2)
-            with ds1:
-                st.markdown("**Local Storage:**")
-                if result.get('local_csv_path'):
-                    st.success(f"CSV saved: `{Path(result['local_csv_path']).name}`")
-                else:
-                    st.error("CSV save failed")
-            with ds2:
-                st.markdown("**HDFS Storage:**")
-                if result.get('hdfs_uploaded'):
-                    st.success("Uploaded to HDFS")
-                    st.caption(f"Path: {result.get('hdfs_path','N/A')}")
-                elif skip_hdfs:
-                    st.info("Skipped")
-                else:
-                    st.warning("Failed (non-critical)")
-            st.markdown("**MongoDB:**")
-            if result.get('mongo_id'):
-                st.success(f"Saved — ID: {result['mongo_id'][:16]}...")
-            elif skip_mongo:
-                st.info("Skipped")
-            else:
-                st.warning("Failed (non-critical)")
-
-        with st.expander("Recent Prediction History (MongoDB)"):
-            try:
-                recent = fetch_recent_predictions(limit=15)
-                if recent:
-                    hdf = pd.DataFrame(recent)
-                    dcols = ['symbol','prediction','confidence','timestamp','source','model']
-                    if all(c in hdf.columns for c in dcols):
-                        hdf = hdf[dcols]
-                        hdf.columns = ['Symbol','Prediction','Confidence (%)','Timestamp','Source','Model']
-                        hdf['Timestamp'] = pd.to_datetime(hdf['Timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
-                        st.dataframe(hdf, use_container_width=True, hide_index=True)
-                    else:
-                        st.dataframe(pd.DataFrame(recent), use_container_width=True)
-                else:
-                    st.info("No records found or MongoDB unavailable.")
-            except Exception as e:
-                st.warning(f"Could not fetch history: {e}")
-
     # ── LSTM Results ──────────────────────────────────────────────────────────
-    elif active_model == 'lstm' and 'lstm_result' in st.session_state:
+    if active_model == 'lstm' and 'lstm_result' in st.session_state:
         lstm_res = st.session_state['lstm_result']
-        hist_df  = st.session_state.get('rf_hist_df')
+        hist_df  = st.session_state.get('chart_df')
 
         # Spark UI Availability Panel
         spark_ui_url = st.session_state.get('spark_ui_url') or lstm_res.get('spark_ui_url')
@@ -1485,6 +1763,33 @@ if mode == "Live Data":
             f"Source: **{lstm_res['source']}**"
         )
 
+        # Phase 4 — prediction metadata, next-session return availability and
+        # per-symbol compatibility feedback.
+        next_return = lstm_res.get("predicted_next_return_pct")
+        nr1, nr2 = st.columns(2)
+        nr1.metric(
+            "Next-session return",
+            "n/a" if next_return is None else f"{next_return:+.2f}%",
+        )
+        nr2.metric(
+            "Model output",
+            f"P(UP) = {lstm_res.get('raw_output', 0.0):.4f}",
+        )
+        st.caption(
+            f"Prediction time (UTC): **{str(lstm_res.get('prediction_timestamp', '-'))[:19].replace('T', ' ')}** | "
+            f"Input data timestamp: **{lstm_res.get('input_data_timestamp') or '-'}** | "
+            f"Feature config: **{lstm_res.get('feature_config', '-')}** | "
+            f"Model ID: **{lstm_res.get('model_id', 'lstm_model.keras')}**"
+        )
+        if next_return is None:
+            st.caption(f"Note: {lstm_res.get('next_return_status', '')}")
+        for compat_warning in lstm_res.get("warnings", []):
+            st.warning(compat_warning)
+        mongo_id = st.session_state.get('lstm_mongo_id', '')
+        st.caption(
+            "MongoDB: " + ("prediction saved (deduplicated)" if mongo_id else "unavailable — not persisted")
+        )
+
         st.markdown("---")
 
         # True LSTM Stock-Specific Visualizations
@@ -1493,7 +1798,7 @@ if mode == "Live Data":
             
             # Forecast chart
             fig_forecast = create_lstm_forecast_chart(hist_df, lstm_res)
-            st.plotly_chart(fig_forecast, use_container_width=True, key="lstm_forecast_chart_plotly")
+            st.plotly_chart(fig_forecast, width="stretch", key="lstm_forecast_chart_plotly")
             
             # Backtest section
             backtest_df = st.session_state.get('lstm_backtest', pd.DataFrame())
@@ -1511,7 +1816,7 @@ if mode == "Live Data":
                 btc3.metric("Correct Directional Signals", f"{correct_signals} / {len(backtest_df)}")
                 
                 fig_backtest = create_lstm_backtest_chart(backtest_df, symbol, backtest_acc)
-                st.plotly_chart(fig_backtest, use_container_width=True, key="lstm_backtest_chart_plotly")
+                st.plotly_chart(fig_backtest, width="stretch", key="lstm_backtest_chart_plotly")
                 
                 with st.expander("Detailed Daily Backtest Logs", expanded=False):
                     st.dataframe(
@@ -1519,7 +1824,7 @@ if mode == "Live Data":
                             lambda x: "background-color: rgba(0, 200, 83, 0.15); color: #00c853;" if x == "UP" or x is True else "background-color: rgba(255, 23, 68, 0.15); color: #ff1744;",
                             subset=["Prediction", "Actual", "Correct"]
                         ),
-                        use_container_width=True
+                        width="stretch"
                     )
             else:
                 st.info("LSTM Backtest: To see historical backtesting metrics, make sure you fetched enough historical data.")
@@ -1536,10 +1841,10 @@ if mode == "Live Data":
         hist_tab1, hist_tab2 = st.tabs(["Loss History", "Accuracy History"])
         with hist_tab1:
             fig_loss = create_lstm_metric_chart("loss")
-            st.plotly_chart(fig_loss, use_container_width=True, key="lstm_global_loss_history_plotly")
+            st.plotly_chart(fig_loss, width="stretch", key="lstm_global_loss_history_plotly")
         with hist_tab2:
             fig_acc = create_lstm_metric_chart("accuracy")
-            st.plotly_chart(fig_acc, use_container_width=True, key="lstm_global_acc_history_plotly")
+            st.plotly_chart(fig_acc, width="stretch", key="lstm_global_acc_history_plotly")
             
         st.markdown("---")
 
@@ -1583,135 +1888,270 @@ if mode == "Live Data":
                         hdf = hdf[dcols]
                         hdf.columns = ['Symbol','Prediction','Confidence (%)','Timestamp','Source','Model']
                         hdf['Timestamp'] = pd.to_datetime(hdf['Timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
-                        st.dataframe(hdf, use_container_width=True, hide_index=True)
+                        st.dataframe(hdf, width="stretch", hide_index=True)
                     else:
-                        st.dataframe(pd.DataFrame(recent), use_container_width=True)
+                        st.dataframe(pd.DataFrame(recent), width="stretch")
                 else:
                     st.info("No records found or MongoDB unavailable.")
             except Exception as e:
                 st.warning(f"Could not fetch history: {e}")
 
+        with st.expander("Recent LSTM Records (MongoDB)"):
+            try:
+                all_lstm_rows = fetch_lstm_predictions(limit=50)
+                history_symbols = sorted({
+                    str(r.get("symbol")) for r in all_lstm_rows if r.get("symbol")
+                })
+                history_symbol = st.selectbox(
+                    "Filter by stock", ["All symbols"] + history_symbols,
+                    key="p5_history_symbol",
+                )
+                lstm_rows = (
+                    all_lstm_rows if history_symbol == "All symbols"
+                    else [r for r in all_lstm_rows if r.get("symbol") == history_symbol]
+                )[:15]
+                if lstm_rows:
+                    ldf = pd.DataFrame(lstm_rows)
+                    columns = {
+                        "symbol": "Symbol",
+                        "prediction": "Direction",
+                        "confidence": "Confidence (%)",
+                        "timestamp": "Prediction Time",
+                    }
+                    available = [c for c in columns if c in ldf.columns]
+                    ldf = ldf[available].rename(columns=columns)
+                    if "Prediction Time" in ldf.columns:
+                        ldf["Prediction Time"] = pd.to_datetime(
+                            ldf["Prediction Time"]
+                        ).dt.strftime("%Y-%m-%d %H:%M:%S")
+                    ldf["Next Return (%)"] = [
+                        (r.get("meta") or {}).get("predicted_next_return_pct", "n/a")
+                        or "n/a"
+                        for r in lstm_rows
+                    ]
+                    ldf["Feature Config"] = [
+                        (r.get("meta") or {}).get("feature_config_version", "-")
+                        for r in lstm_rows
+                    ]
+                    st.dataframe(ldf, width="stretch", hide_index=True)
+                else:
+                    st.info("No LSTM prediction records found or MongoDB unavailable.")
+            except Exception as e:
+                st.warning(f"Could not fetch LSTM history: {e}")
+
     else:
         # No prediction yet — show instructions
-        st.info("Click **Predict with Random Forest** or **Predict with LSTM** to get a prediction.")
+        st.info("Click **Predict with LSTM** to get a prediction.")
         st.markdown("")
-        col_info1, col_info2 = st.columns(2)
-        with col_info1:
-            st.markdown("#### Random Forest")
-            st.markdown("""
-- Uses **21 technical indicators** (snapshot)
-- Fast prediction
-- Works with any stock in dataset
-- Shows feature importance
-- Available in Live & Manual modes
-            """)
-        with col_info2:
-            st.markdown("#### LSTM")
-            st.markdown(f"""
+        st.markdown("#### LSTM (Deep Learning)")
+        st.markdown(f"""
 - Uses **60-day sequence** of historical data
 - Captures temporal patterns & trends
 - {"Model trained and ready" if lstm_ready else "Not trained yet — run `python scripts/train_lstm_model.py`"}
 - Shows training curves (loss & accuracy)
-- Live mode only
-            """)
+        """)
 
 # ---------------------------------------------------------------------------
-# MANUAL MODE
+# DISTRIBUTED PIPELINE MODE — HDFS -> Spark -> Parquet -> LSTM -> MongoDB
 # ---------------------------------------------------------------------------
 
-elif mode == "Manual Input":
-    st.markdown(f"### Manual Input — {selected_stock}")
-    st.markdown("Enter OHLCV values and computed technical indicators:")
-    st.caption("Using **Random Forest** — manual mode provides a single snapshot, which is exactly what RF needs.")
+elif mode == "Distributed Pipeline":
+    st.markdown("### Distributed Stock Intelligence Pipeline")
+    st.caption(
+        "Enforced flow: market data → HDFS raw → Apache Spark → HDFS Parquet → "
+        "existing NASDAQ LSTM → MongoDB. Predictions are model outputs, not "
+        "guaranteed investment advice."
+    )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        open_p = st.number_input("Open Price ($)", value=150.0, step=0.01, format="%.2f")
-        high_p = st.number_input("High Price ($)", value=155.0, step=0.01, format="%.2f")
-        low_p = st.number_input("Low Price ($)", value=148.0, step=0.01, format="%.2f")
-        close_p = st.number_input("Close Price ($)", value=153.0, step=0.01, format="%.2f")
-        volume = st.number_input("Volume", value=50000000, step=100000)
-        ma5 = st.number_input("MA5", value=152.0, step=0.01, format="%.2f")
-    with col2:
-        ma10 = st.number_input("MA10", value=151.0, step=0.01, format="%.2f")
-        ma20 = st.number_input("MA20", value=150.0, step=0.01, format="%.2f")
-        daily_ret = st.number_input("Daily Returns (%)", value=0.5, step=0.01, format="%.4f")
-        volatility = st.number_input("Volatility (H-L)", value=7.0, step=0.01, format="%.2f")
-        price_chg = st.number_input("Price Change %", value=2.0, step=0.01, format="%.4f")
-        lag1 = st.number_input("Lag 1 (Prev Close)", value=151.5, step=0.01, format="%.2f")
-    with col3:
-        lag3 = st.number_input("Lag 3 (3-day Close)", value=149.0, step=0.01, format="%.2f")
-        rsi = st.number_input("RSI (14)", value=55.0, min_value=0.0, max_value=100.0, step=0.1)
-        vol_chg = st.number_input("Volume Change %", value=5.0, step=0.01, format="%.4f")
-        ema12 = st.number_input("EMA12", value=151.5, step=0.01, format="%.2f")
-        bb_pos = st.number_input("Bollinger Position (0-1)", value=0.6, min_value=0.0, max_value=1.5, step=0.01)
-        macd = st.number_input("MACD", value=0.5, step=0.01, format="%.4f")
-        macd_signal = st.number_input("MACD Signal", value=0.4, step=0.01, format="%.4f")
-        macd_hist = st.number_input("MACD Histogram", value=0.1, step=0.01, format="%.4f")
-        bb_width = st.number_input("Bollinger Width (%)", value=4.0, step=0.01, format="%.4f")
-        weekly_momentum = st.number_input("Weekly Momentum (%)", value=1.5, step=0.01, format="%.4f")
-        avg_volume_trend = st.number_input("Average Volume Trend", value=1.0, step=0.01, format="%.4f")
-        avg_5d_volume_trend = st.number_input("Average 5-Day Volume Trend", value=1.0, step=0.01, format="%.4f")
-        trend_strength = st.number_input("Trend Strength (%)", value=0.8, step=0.01, format="%.4f")
-        rolling_std_returns = st.number_input("Rolling Std Returns", value=1.2, step=0.01, format="%.4f")
+    all_universe = discover_universe("all")
+    coverage = classify_coverage(all_universe)
 
-    st.markdown("")
+    ov1, ov2, ov3, ov4, ov5 = st.columns(5)
+    ov1.metric("Total symbols", f"{coverage['discovered']:,}")
+    ov2.metric("Stocks", f"{coverage['stocks']:,}")
+    ov3.metric("ETFs", f"{coverage['etfs']:,}")
+    ov4.metric("With local history", f"{coverage['with_local_data']:,}")
+    ov5.metric("HDFS", "READY" if _infra['hdfs'] else "OFFLINE")
 
-    if st.button("Predict", use_container_width=True, type="primary"):
-        features = {
-            "Open": open_p, "High": high_p, "Low": low_p, "Close": close_p,
-            "Volume": volume, "MA5": ma5, "MA10": ma10, "MA20": ma20,
-            "Daily_Returns": daily_ret, "Volatility": volatility,
-            "Price_Change_Pct": price_chg, "Lag_1": lag1, "Lag_3": lag3,
-            "RSI": rsi, "EMA12": ema12, "MACD": macd, "MACD_Signal": macd_signal,
-            "BB_Width": bb_width, "Weekly_Momentum": weekly_momentum,
-            "Avg_5D_Volume_Trend": avg_5d_volume_trend,
-            "Trend_Strength": trend_strength,
-        }
-        
-        # Make prediction
-        direction, confidence, probs = predict_direction(features)
-        
-        # Display prediction
-        st.markdown("")
-        render_prediction(direction, confidence)
-        st.markdown("")
-        st.caption(f"DOWN probability: {probs[0]*100:.1f}% | UP probability: {probs[1]*100:.1f}%")
-        
-        # Save to MongoDB
-        try:
-            prediction_label = "UP" if direction == "UP" else "DOWN"
-            mongo_id = save_prediction(
-                symbol=symbol,
-                prediction=prediction_label,
-                confidence=confidence,
-                source="manual_input",
-                model="Random Forest (Final)",
-                meta={
-                    "input_type": "manual",
-                    "down_probability": float(probs[0]),
-                    "up_probability": float(probs[1]),
-                    "quote": {
-                        "open": open_p,
-                        "high": high_p,
-                        "low": low_p,
-                        "close": close_p,
-                        "volume": volume,
-                    },
-                    "features": features,
-                },
-            )
-            
-            if mongo_id:
-                st.success(f"Prediction saved to MongoDB (ID: {mongo_id[:12]}...)")
+    with st.expander("Stock selection & pipeline run", expanded=True):
+        asset_type = st.selectbox("Asset category", ["stocks", "etfs"], key="p52_asset")
+        universe = discover_universe(asset_type)
+        search_term = st.text_input(
+            "Search ticker", placeholder="e.g. AAPL or Apple", key="p52_search"
+        )
+        if search_term:
+            matches = [
+                s.symbol for s in universe
+                if search_term.strip().upper() in s.symbol
+                or search_term.lower() in s.security_name.lower()
+            ][:20]
+            st.caption(f"Matches: {', '.join(matches) if matches else 'none'}")
+        p52_symbols = st.text_input(
+            "Symbols (comma-separated)",
+            value="AAPL,MSFT,NVDA,AMZN,GOOGL",
+            key="p52_symbols",
+            help="Full universe is supported; batches are bounded and resumable.",
+        )
+        data_mode = st.selectbox(
+            "Data mode", ["local_historical", "live_incremental"], key="p52_mode"
+        )
+        # Result keys MUST differ from widget keys: Streamlit forbids writing
+        # to a key already bound to a widget and stores a bool there otherwise.
+        st.session_state.setdefault('p52_run_result', None)
+        b1, b2, b3 = st.columns(3)
+        run_clicked = b1.button("Run HDFS+Spark pipeline", key="p52_run_button", type="primary")
+        coverage_clicked = b2.button("Full-universe coverage", key="p52_coverage_button")
+        refresh_clicked = b3.button("Refresh live data to HDFS", key="p52_refresh_button")
+
+        if coverage_clicked:
+            report = classify_coverage(discover_universe(asset_type))
+            st.json({k: v for k, v in report.items() if k != "symbols"})
+
+        if refresh_clicked:
+            first = p52_symbols.split(",")[0].strip().upper() if p52_symbols else ""
+            if first:
+                with st.spinner(f"Acquiring {first} and writing to HDFS..."):
+                    try:
+                        status = StockIntelligencePipeline().ingest_live(first)
+                        st.json(status)
+                    except Exception as exc:
+                        logger.exception("Live HDFS refresh failed")
+                        st.error(f"Live refresh failed: {exc}")
+
+        if run_clicked:
+            selected = [s.strip().upper() for s in p52_symbols.split(",") if s.strip()]
+            request_signature = f"{selected}|{data_mode}|{asset_type}"
+            if not selected:
+                st.warning("Enter at least one symbol.")
+            elif st.session_state.get('p52_last_request') == request_signature:
+                st.caption("This exact pipeline request has already completed; use Refresh or change inputs to run again.")
             else:
-                st.info("MongoDB save skipped or unavailable")
-                
-        except Exception as e:
-            st.warning(f"Could not save to MongoDB: {e}")
-            st.caption("Prediction completed successfully, but database storage failed (non-critical)")
-        
-        # --- Spark Processing for Manual Input ---
+                st.session_state['p52_last_request'] = request_signature
+                with st.spinner("Running HDFS → Spark → Parquet → LSTM → MongoDB..."):
+                    pipeline = StockIntelligencePipeline()
+                    payloads = {}
+                    try:
+                        run = pipeline.run(selected, mode=data_mode, asset_type=asset_type)
+                        result = normalize_run_result(run)
+                        if run.predictions:
+                            spark = get_spark()
+                            for prediction in run.predictions:
+                                sym = prediction["symbol"]
+                                frame = pipeline.feature_reader(
+                                    spark, run.run_id, asset_type, sym, limit=300
+                                )
+                                payloads[sym] = build_market_payload(frame, sym)
+                    except Exception as exc:
+                        logger.exception("Distributed pipeline failed")
+                        result = normalize_run_result({
+                            "run_id": f"failed-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                            "status": "failed",
+                            "mode": data_mode,
+                            "asset_type": asset_type,
+                            "errors": [f"{type(exc).__name__}: {exc}"],
+                            "failed_symbols": {s: "pipeline_failed" for s in selected},
+                        })
+                        st.error(f"Distributed pipeline failed: {exc}")
+                    st.session_state['p52_run_result'] = result
+                    st.session_state['p52_payloads_result'] = payloads
+
+    run_state = normalize_run_result(st.session_state.get('p52_run_result'))
+    if run_state:
+        st.markdown("#### Pipeline execution metrics")
+        st.caption(
+            f"Run ID: **{run_state['run_id']}** | Status: **{run_state['status']}** | "
+            f"Mode: **{run_state['mode']}** | Started: {run_state['started_at']} | "
+            f"Finished: {run_state['finished_at']}"
+        )
+        rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+        rc1.metric("Symbols ingested", run_state["symbols_ingested"])
+        rc2.metric("Symbols processed", run_state["symbols_processed"])
+        rc3.metric("Spark input rows", f"{run_state['input_records']:,}")
+        rc4.metric("Parquet output rows", f"{run_state['output_records']:,}")
+        rc5.metric("Predictions", len(run_state["predictions"]))
+        st.caption(
+            f"HDFS parquet: **{run_state['hdfs_paths'].get('parquet', '-')}** | "
+            f"Manifest: **{run_state['hdfs_paths'].get('manifest', '-')}** | "
+            f"Spark: **{run_state['spark_info'].get('spark_version', '-')}** | "
+            f"MongoDB writes: **{len(run_state['mongo_ids'])}**"
+        )
+        if run_state.get("failed_symbols"):
+            st.error("Failed symbols: " + "; ".join(
+                f"{k} ({v})" for k, v in run_state["failed_symbols"].items()
+            ))
+        if run_state.get("incompatible_symbols"):
+            st.warning("Incompatible symbols: " + "; ".join(
+                f"{k} ({v})" for k, v in run_state["incompatible_symbols"].items()
+            ))
+        with st.expander("Spark processing details", expanded=False):
+            st.json(run_state.get("spark_info", {}))
+
+        successful = [p for p in run_state["predictions"] if p.get("ok")]
+        if successful:
+            st.markdown("#### Multi-Stock Analysis (processed Parquet inputs)")
+            payloads = st.session_state.get('p52_payloads_result', {})
+            tabs = st.tabs(["Overview"] + [p["symbol"] for p in successful])
+            summary_rows = [{
+                "Symbol": p["symbol"],
+                "Direction": p["prediction"],
+                "P(UP) %": p["probabilities"]["UP"],
+                "P(DOWN) %": p["probabilities"]["DOWN"],
+                "Confidence %": p["confidence"],
+                "Model P(UP)": p["raw_output"],
+                "Input session": p["input_data_timestamp"],
+                "Prediction time": p["prediction_timestamp"],
+            } for p in successful]
+            tabs[0].dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+            tabs[0].caption(
+                "Select a stock tab for its own candlestick, price, volume, RSI, "
+                "MACD, Bollinger, returns and probability charts."
+            )
+            for tab, prediction in zip(tabs[1:], successful):
+                with tab:
+                    render_market_analytics(
+                        payloads.get(prediction["symbol"], {}), prediction
+                    )
+
+    with st.expander("Historical predictions (MongoDB)", expanded=False):
+        try:
+            rows = fetch_lstm_predictions(limit=20)
+            if rows:
+                history_rows = []
+                for row in rows:
+                    meta = row.get("meta") or {}
+                    history_rows.append({
+                        "Symbol": row.get("symbol"),
+                        "Direction": row.get("prediction"),
+                        "UP %": meta.get("direction_probabilities", {}).get("UP"),
+                        "DOWN %": meta.get("direction_probabilities", {}).get("DOWN"),
+                        "Prediction time": row.get("timestamp"),
+                        "Input session": meta.get("latest_market_session"),
+                        "Run ID": meta.get("processing_run_id", "-"),
+                        "HDFS Parquet": (
+                            str(meta.get("hdfs_parquet_reference", "-"))[:48]
+                        ),
+                    })
+                st.dataframe(
+                    pd.DataFrame(history_rows), width="stretch", hide_index=True
+                )
+            else:
+                st.info("No prediction records found or MongoDB unavailable.")
+        except Exception as exc:
+            st.warning(f"Could not fetch prediction history: {exc}")
+
+# ---------------------------------------------------------------------------
+# SPARK PROCESSING MODE (big-data demo; predictions are LSTM-only in Live mode)
+# ---------------------------------------------------------------------------
+
+elif mode == "Spark Processing":
+    st.markdown(f"### Spark Big Data Processing — {selected_stock}")
+    st.caption(
+        "Distributed feature-engineering demo over the training dataset. "
+        "Stock predictions are generated by the LSTM model in Live Data mode."
+    )
+
+    if st.button("Run Spark Processing", width="stretch", type="primary"):
+        # --- Spark Processing ---
         st.markdown("---")
         st.markdown("### Spark Big Data Processing")
         
@@ -1817,6 +2257,6 @@ elif mode == "Manual Input":
                 
             except Exception as e:
                 st.warning(f"Spark processing failed (non-critical): {e}")
-                st.caption("Prediction completed successfully. Spark processing is optional for manual mode.")
+                st.caption("Spark processing is optional and non-critical for the LSTM prediction workflow.")
 
 

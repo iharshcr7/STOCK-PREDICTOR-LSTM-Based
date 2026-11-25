@@ -21,6 +21,7 @@ import requests
 from pathlib import Path
 from datetime import datetime
 from model_config import get_expected_features, validate_feature_schema
+from lstm_data_pipeline import compute_technical_features, prepare_symbol_frame
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -111,7 +112,14 @@ def fetch_alpha_vantage(symbol: str, api_key: str, outputsize: str = "compact") 
     # Check for API errors and rate limits
     if "Error Message" in data:
         raise ValueError(f"Alpha Vantage error: {data['Error Message']}")
-    
+
+    # Premium-only endpoints (e.g. outputsize=full) are NOT rate limits. Keep
+    # them distinct so callers can choose a free-tier strategy instead of
+    # retrying and burning the daily quota.
+    for _key in ("Note", "Information"):
+        if _key in data and "premium" in str(data[_key]).lower():
+            raise ValueError(f"Alpha Vantage premium restriction: {data[_key]}")
+
     # Check for rate limit messages (both "Note" and "Information" keys)
     if "Note" in data:
         logger.error(f"Alpha Vantage rate limit hit: {data['Note']}")
@@ -184,7 +192,10 @@ def fetch_yfinance(symbol: str, period: str = "3mo") -> pd.DataFrame:
     hist = ticker.history(period=period)
 
     if hist.empty:
-        raise ValueError(f"No data returned from yfinance for {symbol}")
+        raise ValueError(
+            f"No data returned from yfinance for {symbol} — symbol may be "
+            "delisted, invalid, or not traded on the configured exchange"
+        )
 
     df = hist[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.insert(0, "Date", df.index)
@@ -202,76 +213,20 @@ def fetch_yfinance(symbol: str, period: str = "3mo") -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def compute_live_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_live_features(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
     """
-    Compute the same engineered features used during training.
-    Expects a DataFrame with at least 30 rows of historical data.
+    Compute the canonical features used during training.
+
+    Delegates to lstm_data_pipeline.compute_technical_features so historical
+    and live indicator values are computed by one implementation. The frame
+    is sorted chronologically and de-duplicated first; the Symbol column is
+    preserved (or added from `symbol` for live single-stock frames).
     """
-    df = df.copy()
-
-    # Moving Averages
-    df["MA5"] = df["Close"].rolling(window=5, min_periods=5).mean()
-    df["MA10"] = df["Close"].rolling(window=10, min_periods=10).mean()
-    df["MA20"] = df["Close"].rolling(window=20, min_periods=20).mean()
-
-    # Daily Returns
-    df["Daily_Returns"] = df["Close"].pct_change() * 100
-
-    # Volatility
-    df["Volatility"] = df["High"] - df["Low"]
-
-    # Price Change %
-    df["Price_Change_Pct"] = ((df["Close"] - df["Open"]) / df["Open"]) * 100
-
-    # Lag Features
-    df["Lag_1"] = df["Close"].shift(1)
-    df["Lag_3"] = df["Close"].shift(3)
-
-    # RSI (14-period, Wilder's smoothing)
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100.0 - (100.0 / (1.0 + rs))
-
-    # Volume Change %
-    df["Volume_Change_Pct"] = df["Volume"].pct_change() * 100
-
-    # EMA 12
-    df["EMA12"] = df["Close"].ewm(span=12, min_periods=12, adjust=False).mean()
-
-    # Bollinger Band Position
-    sma20 = df["Close"].rolling(window=20, min_periods=20).mean()
-    std20 = df["Close"].rolling(window=20, min_periods=20).std()
-    upper = sma20 + 2 * std20
-    lower = sma20 - 2 * std20
-    band_width = upper - lower
-    df["BB_Position"] = (df["Close"] - lower) / band_width.replace(0, np.nan)
-
-    # MACD family
-    ema12_fast = df["Close"].ewm(span=12, adjust=False, min_periods=12).mean()
-    ema26_slow = df["Close"].ewm(span=26, adjust=False, min_periods=26).mean()
-    df["MACD"] = ema12_fast - ema26_slow
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False, min_periods=9).mean()
-    df["MACD_Hist"] = df["MACD"] - df["MACD_Signal"]
-
-    # Bollinger Width (normalized)
-    df["BB_Width"] = ((upper - lower) / sma20.replace(0, np.nan)) * 100
-
-    # Weekly momentum and volume trend
-    df["Weekly_Momentum"] = df["Close"].pct_change(periods=5) * 100
-    vol_ma10 = df["Volume"].rolling(window=10, min_periods=10).mean()
-    df["Avg_Volume_Trend"] = df["Volume"] / vol_ma10.replace(0, np.nan)
-    vol_ma5 = df["Volume"].rolling(window=5, min_periods=5).mean()
-    df["Avg_5D_Volume_Trend"] = df["Volume"] / vol_ma5.replace(0, np.nan)
-
-    # Trend strength and rolling return risk
-    df["Trend_Strength"] = ((df["MA5"] - df["MA20"]).abs() / df["MA20"].replace(0, np.nan)) * 100
-    df["Rolling_Std_Returns"] = df["Daily_Returns"].rolling(window=10, min_periods=10).std()
-
-    return df
+    if symbol is not None and ("Symbol" not in df.columns or df["Symbol"].isna().all()):
+        df = df.copy()
+        df["Symbol"] = symbol
+    prepared = prepare_symbol_frame(df, symbol=symbol)
+    return compute_technical_features(prepared)
 
 
 def validate_live_feature_schema(feature_columns: list[str]) -> None:
@@ -334,8 +289,8 @@ def fetch_live_stock_data(
         df = fetch_yfinance(symbol)
         used_source = "yfinance"
 
-    # --- Compute features ---
-    df = compute_live_features(df)
+    # --- Compute features (single symbol, chronological, Symbol preserved) ---
+    df = compute_live_features(df, symbol=symbol)
 
     validate_live_feature_schema(MODEL_FEATURES)
 
@@ -386,9 +341,8 @@ def get_historical_for_chart(
 
     if source in ("alpha_vantage", "auto"):
         try:
-            # If period is 1 year or more, request full dataset
-            outputsize = "full" if period in ("1y", "2y", "5y", "max") else "compact"
-            df = fetch_alpha_vantage(symbol, api_key or DEFAULT_API_KEY, outputsize=outputsize)
+            # Free tier only supports outputsize='compact'; 'full' is premium.
+            df = fetch_alpha_vantage(symbol, api_key or DEFAULT_API_KEY, outputsize="compact")
         except Exception:
             pass
 

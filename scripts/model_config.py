@@ -1,9 +1,11 @@
 """
 model_config.py
 ===============
-Shared production configuration and validation for final Random Forest system.
+Shared feature-schema configuration and validation for the LSTM deep-learning
+prediction pipeline (also used by the live-data and Spark processing modules).
 
-UPDATED: Removed stable stock restrictions - now supports all stocks dynamically.
+UPDATED: Removed Random Forest model paths and RF metadata dependency;
+the 21-feature schema used by the LSTM is preserved unchanged.
 """
 
 from __future__ import annotations
@@ -13,8 +15,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
-FINAL_MODEL_FILE = MODELS_DIR / "final_random_forest.pkl"
-MODEL_METADATA_FILE = MODELS_DIR / "model_metadata.json"
+LSTM_METADATA_FILE = MODELS_DIR / "lstm_metadata.json"
 
 SYMBOL_COLUMN = "Symbol"
 DATE_COLUMN = "Date"
@@ -50,10 +51,11 @@ FINAL_FEATURE_COLUMNS = [
 
 
 def read_model_metadata() -> dict:
-    if not MODEL_METADATA_FILE.exists():
+    """Read LSTM metadata (same feature schema as the shared config below)."""
+    if not LSTM_METADATA_FILE.exists():
         return {}
     try:
-        return json.loads(MODEL_METADATA_FILE.read_text(encoding="utf-8"))
+        return json.loads(LSTM_METADATA_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {}
 

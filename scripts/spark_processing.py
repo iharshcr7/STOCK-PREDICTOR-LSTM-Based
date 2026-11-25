@@ -18,6 +18,7 @@ This module provides:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import os
@@ -41,47 +42,90 @@ REQUIRED_COLUMNS = ["Symbol", "Date", "Open", "High", "Low", "Close", "Volume"]
 
 def build_spark(app_name: str = "StockBigDataProcessing", use_hdfs: bool = False) -> SparkSession:
     """
-    Build and configure Spark session with optional HDFS support and optimized logging.
-    
-    Args:
-        app_name: Name of the Spark application
-        use_hdfs: Whether to configure HDFS (default: False for local files)
-        
-    Returns:
-        Configured SparkSession instance
+    Build a validated Spark session (local files or HDFS).
+
+    Windows safety: the Java gateway is launched with a cwd that contains no
+    spaces/parentheses via ``spark_env`` before the first SparkContext exists.
+    This uses PySpark's own ``popen_kwargs`` mechanism — no shell command
+    strings are constructed. HDFS settings are validated only when HDFS is
+    enabled, so local mode works without Hadoop configuration.
     """
     try:
-        # Fix Python version mismatch between driver and worker
+        from spark_env import diagnose_environment, ensure_spark_ready
+
+        environment = diagnose_environment()
+        java = environment.get("java", {})
+        spark_check = environment.get("spark", {})
+
+        if not java.get("found"):
+            raise RuntimeError(
+                "JAVA_HOME is not configured or java.exe was not found. "
+                f"Diagnostics: {java.get('message')}"
+            )
+        if not java.get("supported"):
+            raise RuntimeError(
+                f"Java {java.get('major')} is not supported by PySpark 3.5.x. "
+                "Use Java 8, 11 or 17."
+            )
+        if not spark_check.get("found"):
+            raise RuntimeError(
+                "SPARK_HOME is not configured or spark-submit was not found."
+            )
+
+        hadoop = environment.get("hadoop", {})
+        if use_hdfs:
+            if not hadoop.get("hadoop_home"):
+                raise RuntimeError("HADOOP_HOME is required when HDFS is enabled")
+            if os.name == "nt" and not hadoop.get("winutils_found"):
+                raise RuntimeError(
+                    "winutils.exe is required for HDFS access on Windows "
+                    f"(expected in {hadoop.get('hadoop_home')}\\bin)"
+                )
+
+        # Applies PYSPARK_PYTHON/HADOOP_CONF_DIR and patches gateway cwd.
+        ensure_spark_ready()
+
         python_exe = sys.executable
-        os.environ["PYSPARK_PYTHON"] = python_exe
-        os.environ["PYSPARK_DRIVER_PYTHON"] = python_exe
-        logger.info(f"Python path set: {python_exe}")
-        
+        logger.info(
+            "Starting Spark %s (app=%s, use_hdfs=%s, java=%s)",
+            spark_check.get("pyspark_version"), app_name, use_hdfs,
+            java.get("version"),
+        )
+
         builder = (
-            SparkSession.builder 
-            .appName(app_name) 
+            SparkSession.builder
+            .appName(app_name)
             .master("local[*]")
             .config("spark.sql.adaptive.enabled", "true")
             .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            .config("spark.sql.shuffle.partitions", "4")
+            .config("spark.default.parallelism", "4")
         )
-        
-        # Only configure HDFS if requested
+
+        namenode = os.environ.get("STOCK_HDFS_NAMENODE", "hdfs://localhost:9000")
         if use_hdfs:
-            builder = builder.config("spark.hadoop.fs.defaultFS", "hdfs://localhost:9000")
-            logger.info("HDFS enabled: hdfs://localhost:9000")
+            builder = builder.config("spark.hadoop.fs.defaultFS", namenode)
+            logger.info("HDFS enabled: %s", namenode)
         else:
+            builder = builder.config("spark.hadoop.fs.defaultFS", "file:///")
             logger.info("HDFS disabled: using local filesystem")
-        
+
         spark = builder.getOrCreate()
-        
-        # Reduce Spark logging verbosity for cleaner output
         spark.sparkContext.setLogLevel("ERROR")
-        logger.info("Spark session initialized successfully")
+        logger.info("Spark session initialized successfully: %s", spark.version)
         return spark
-        
-    except Exception as e:
+
+    except Exception as exc:
         logger.exception("Failed to initialize Spark session")
-        raise
+        try:
+            from spark_env import diagnose_environment
+            diagnostics = diagnose_environment()
+        except Exception:
+            diagnostics = {}
+        raise RuntimeError(
+            f"Spark initialization failed: {exc}\n"
+            f"Environment diagnostics: {json.dumps(diagnostics, default=str)[:2000]}"
+        ) from exc
 
 
 def validate_columns(df: DataFrame, required_cols: List[str]) -> None:
@@ -195,12 +239,16 @@ def generate_features(df: DataFrame) -> DataFrame:
     """
     logger.info("Generating features...")
     
-    # Define window specifications
+    # Window is ALWAYS symbol-partitioned and chronologically ordered.
+    # Rolling columns use pandas-style min_periods via a row-count guard.
     w = Window.partitionBy("Symbol").orderBy("Date")
     w5 = w.rowsBetween(-4, 0)
     w10 = w.rowsBetween(-9, 0)
     w20 = w.rowsBetween(-19, 0)
-    
+
+    def _full_window_avg(column: str, spec: Window, n: int):
+        return F.when(F.count(column).over(spec) == n, F.avg(column).over(spec))
+
     # Price-based features
     df = df.withColumn("Daily_Returns_Spark", 
                        (F.col("Close") / F.lag("Close", 1).over(w) - 1.0) * 100.0)
@@ -208,20 +256,22 @@ def generate_features(df: DataFrame) -> DataFrame:
     df = df.withColumn("Weekly_Momentum_Spark", 
                        (F.col("Close") / F.lag("Close", 5).over(w) - 1.0) * 100.0)
     
-    # Improved volatility formula: (High - Low) / Close * 100
+    # Diagnostic Spark volatility (normalised); NOT an LSTM model input.
     df = df.withColumn("Volatility_Spark", 
                        ((F.col("High") - F.col("Low")) / F.col("Close")) * 100.0)
     
-    # Moving averages
-    df = df.withColumn("MA5_Spark", F.avg("Close").over(w5))
-    df = df.withColumn("MA10_Spark", F.avg("Close").over(w10))
-    df = df.withColumn("MA20_Spark", F.avg("Close").over(w20))
+    # Moving averages with min_periods parity
+    df = df.withColumn("MA5_Spark", _full_window_avg("Close", w5, 5))
+    df = df.withColumn("MA10_Spark", _full_window_avg("Close", w10, 10))
+    df = df.withColumn("MA20_Spark", _full_window_avg("Close", w20, 20))
     
-    # Rolling standard deviation (20-day)
-    df = df.withColumn("Rolling_Std_20_Spark", F.stddev("Close").over(w20))
+    # Rolling standard deviation (20-day), with min_periods parity
+    df = df.withColumn("Rolling_Std_20_Spark", F.when(
+        F.count("Close").over(w20) == 20, F.stddev("Close").over(w20)
+    ))
     
     # Volume features
-    df = df.withColumn("Volume_MA20_Spark", F.avg("Volume").over(w20))
+    df = df.withColumn("Volume_MA20_Spark", _full_window_avg("Volume", w20, 20))
     df = df.withColumn("Volume_Ratio_Spark", 
                        F.col("Volume") / F.col("Volume_MA20_Spark"))
     

@@ -32,6 +32,13 @@ import numpy as np
 import pandas as pd
 import joblib
 
+from lstm_data_pipeline import (
+    FEATURE_COLUMNS as CANONICAL_FEATURES,
+    compute_technical_features,
+    prepare_symbol_frame,
+    transform_sequences,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -52,14 +59,8 @@ LSTM_METADATA_FILE = MODELS_DIR / "lstm_metadata.json"
 
 SEQUENCE_LENGTH = 60  # Must match training
 
-FEATURE_COLUMNS = [
-    "Open", "High", "Low", "Close", "Volume",
-    "MA5", "MA10", "MA20", "EMA12",
-    "RSI", "MACD", "MACD_Signal",
-    "Daily_Returns", "Volatility", "Price_Change_Pct",
-    "Weekly_Momentum", "Trend_Strength", "BB_Width",
-    "Avg_5D_Volume_Trend", "Lag_1", "Lag_3",
-]
+# Single source of truth: canonical 21-feature schema (order included).
+FEATURE_COLUMNS = list(CANONICAL_FEATURES)
 
 # Global cache — avoids reloading model on every prediction
 _LSTM_MODEL_CACHE = None
@@ -132,98 +133,50 @@ def load_lstm_scaler(use_cache: bool = True):
 # Feature Engineering (mirrors fetch_live_data.py)
 # ---------------------------------------------------------------------------
 
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_features(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
     """
-    Compute the same 21 technical indicator features used during LSTM training.
-    Mirrors compute_live_features() in fetch_live_data.py exactly.
+    Compute the canonical 21 features used during LSTM training.
+
+    Delegates to lstm_data_pipeline.compute_technical_features — the same
+    implementation used by feature_engineering.py and fetch_live_data.py.
     """
-    df = df.copy()
-
-    df["MA5"]  = df["Close"].rolling(window=5,  min_periods=5).mean()
-    df["MA10"] = df["Close"].rolling(window=10, min_periods=10).mean()
-    df["MA20"] = df["Close"].rolling(window=20, min_periods=20).mean()
-
-    df["Daily_Returns"]   = df["Close"].pct_change() * 100
-    df["Volatility"]      = df["High"] - df["Low"]
-    df["Price_Change_Pct"] = ((df["Close"] - df["Open"]) / df["Open"]) * 100
-
-    df["Lag_1"] = df["Close"].shift(1)
-    df["Lag_3"] = df["Close"].shift(3)
-
-    # RSI (14-period, Wilder's smoothing)
-    delta    = df["Close"].diff()
-    gain     = delta.clip(lower=0)
-    loss     = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100.0 - (100.0 / (1.0 + rs))
-
-    df["EMA12"] = df["Close"].ewm(span=12, min_periods=12, adjust=False).mean()
-
-    ema12 = df["Close"].ewm(span=12, adjust=False, min_periods=12).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False, min_periods=26).mean()
-    df["MACD"]        = ema12 - ema26
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False, min_periods=9).mean()
-
-    sma20 = df["Close"].rolling(window=20, min_periods=20).mean()
-    std20 = df["Close"].rolling(window=20, min_periods=20).std()
-    upper = sma20 + 2 * std20
-    lower = sma20 - 2 * std20
-    df["BB_Width"] = ((upper - lower) / sma20.replace(0, np.nan)) * 100
-
-    df["Weekly_Momentum"]    = df["Close"].pct_change(periods=5) * 100
-    vol_ma5                  = df["Volume"].rolling(window=5, min_periods=5).mean()
-    df["Avg_5D_Volume_Trend"] = df["Volume"] / vol_ma5.replace(0, np.nan)
-
-    ma5  = df["Close"].rolling(window=5,  min_periods=5).mean()
-    ma20 = df["Close"].rolling(window=20, min_periods=20).mean()
-    df["Trend_Strength"] = ((ma5 - ma20).abs() / ma20.replace(0, np.nan)) * 100
-
-    return df
+    prepared = prepare_symbol_frame(df, symbol=symbol)
+    return compute_technical_features(prepared)
 
 
 # ---------------------------------------------------------------------------
 # Sequence Builder
 # ---------------------------------------------------------------------------
 
-def build_prediction_sequence(df: pd.DataFrame, scaler) -> np.ndarray:
+def build_prediction_sequence(df: pd.DataFrame, scaler, symbol: str | None = None) -> np.ndarray:
     """
-    Build the input sequence for LSTM prediction from a historical DataFrame.
+    Build one (1, 60, 21) input sequence from a SINGLE symbol's history.
 
     Steps:
-        1. Compute features
-        2. Drop rows with NaN (warmup period)
-        3. Take the last SEQUENCE_LENGTH rows
-        4. Scale with the fitted scaler
-        5. Reshape to (1, SEQUENCE_LENGTH, n_features)
+        1. Validate/sort/de-duplicate the symbol's chronological rows
+        2. Compute canonical trailing features
+        3. Drop warmup rows with incomplete features
+        4. Take the last SEQUENCE_LENGTH consecutive observations
+        5. Apply the already-fitted scaler (never re-fit) with [0,1] clipping
 
-    Returns
-    -------
-    np.ndarray  shape (1, SEQUENCE_LENGTH, n_features)
+    The sequence ends at the latest available observation; the model predicts
+    the session immediately after it. No target column is used at inference.
     """
-    df = compute_features(df)
-
-    # Keep only feature columns and drop NaN rows
-    df_feat = df[FEATURE_COLUMNS].dropna()
+    prepared = prepare_symbol_frame(df, symbol=symbol) if symbol or "Symbol" in df.columns else df.copy()
+    df_feat = compute_technical_features(prepared)[FEATURE_COLUMNS].dropna()
 
     if len(df_feat) < SEQUENCE_LENGTH:
         raise ValueError(
-            f"Not enough data to build LSTM sequence. "
-            f"Need at least {SEQUENCE_LENGTH} rows after feature computation, "
+            f"Not enough data to build LSTM sequence for {symbol or 'symbol'}. "
+            f"Need at least {SEQUENCE_LENGTH} valid rows after feature computation, "
             f"got {len(df_feat)}. "
             f"Try fetching more historical data (use outputsize='full' for Alpha Vantage "
             f"or period='1y' for yfinance)."
         )
 
-    # Take the most recent SEQUENCE_LENGTH rows
     sequence = df_feat.tail(SEQUENCE_LENGTH).values.astype(np.float32)
-
-    # Scale
-    sequence_scaled = scaler.transform(sequence)
-
-    # Reshape to (1, seq_len, n_features)
-    return sequence_scaled.reshape(1, SEQUENCE_LENGTH, len(FEATURE_COLUMNS))
+    scaled = transform_sequences(scaler, sequence.reshape(1, SEQUENCE_LENGTH, len(FEATURE_COLUMNS)))
+    return scaled.reshape(1, SEQUENCE_LENGTH, len(FEATURE_COLUMNS))
 
 
 # ---------------------------------------------------------------------------
@@ -261,9 +214,9 @@ def predict_lstm_live(
     model  = load_lstm_model()
     scaler = load_lstm_scaler()
 
-    # 2. Fetch historical data (need enough rows for sequence + warmup)
-    #    We request 'full' from Alpha Vantage or '1y' from yfinance
-    #    to ensure we have at least SEQUENCE_LENGTH + 30 (warmup) rows
+    # 2. Fetch historical data (need enough rows for sequence + warmup).
+    #    Yahoo Finance is primary; Alpha Vantage uses the free-tier 'compact'
+    #    endpoint (~100 sessions, enough for the 60-session window + warmup).
     logger.info("Fetching historical data for %s...", symbol)
 
     try:
@@ -274,29 +227,26 @@ def predict_lstm_live(
     df = None
     used_source = None
 
-    if source in ("alpha_vantage", "auto"):
+    if source in ("yfinance", "auto"):
         try:
-            import os
-            _api_key = api_key or os.environ.get("ALPHA_VANTAGE_API_KEY", "")
-            # Use 'full' outputsize to get enough history for the sequence
-            df = fetch_alpha_vantage(symbol, _api_key, outputsize="full")
-            used_source = "alpha_vantage"
+            df = fetch_yfinance(symbol, period="1y")
+            used_source = "yfinance"
         except Exception as e:
-            logger.warning("Alpha Vantage failed: %s", e)
-            if source == "alpha_vantage":
+            logger.warning("yfinance failed for %s: %s", symbol, e)
+            if source == "yfinance":
                 raise
-            logger.info("Falling back to yfinance...")
 
-    if df is None:
-        # Use 1 year of data — enough for 60-day sequence + warmup
-        df = fetch_yfinance(symbol, period="1y")
-        used_source = "yfinance"
+    if df is None and source in ("alpha_vantage", "auto"):
+        import os
+        _api_key = api_key or os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+        df = fetch_alpha_vantage(symbol, _api_key, outputsize="compact")
+        used_source = "alpha_vantage"
 
     logger.info("Fetched %d rows from %s", len(df), used_source)
 
     # 3. Build prediction sequence
     logger.info("Building LSTM input sequence (last %d days)...", SEQUENCE_LENGTH)
-    X = build_prediction_sequence(df, scaler)
+    X = build_prediction_sequence(df, scaler, symbol=symbol)
     logger.info("Sequence shape: %s", X.shape)
 
     # 4. Run prediction

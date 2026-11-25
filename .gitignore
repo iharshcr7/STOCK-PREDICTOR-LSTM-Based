@@ -24,3 +24,4 @@ test_spark_output.parquet/
 
 .env
 venv/
+node_modules/
