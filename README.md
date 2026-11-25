@@ -1,4 +1,4 @@
-# NASDAQ AI Stock Predictor
+# Stock-Predictor-LSTM-BASED
 
 A Python-based stock direction prediction project with a Streamlit dashboard, live market data fetching, Random Forest and LSTM models, optional MongoDB prediction history, and optional Spark/HDFS processing for big-data workflow demonstration.
 
